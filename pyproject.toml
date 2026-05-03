@@ -1,6 +1,6 @@
 [project]
 name = "surval"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sequential-validation and state-conditional threshold tooling."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,7 +15,8 @@ dependencies = [
 encoder = ["torch>=2.0"]
 db = ["faiss-cpu>=1.8.0"]
 sanity = ["matplotlib>=3.5"]
-full = ["surval[encoder,db,sanity]"]
+omn = ["scikit-learn>=1.0"]
+full = ["surval[encoder,db,sanity,omn]"]
 dev = ["pytest>=8.0"]
 
 [build-system]
