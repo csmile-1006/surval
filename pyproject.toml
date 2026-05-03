@@ -1,0 +1,29 @@
+[project]
+name = "surval"
+version = "0.1.0"
+description = "Sequential-validation and state-conditional threshold tooling."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.22",
+    "h5py>=3.0",
+    "tensorboardX>=2.6",
+]
+
+[project.optional-dependencies]
+encoder = ["torch>=2.0"]
+db = ["faiss-cpu>=1.8.0"]
+sanity = ["matplotlib>=3.5"]
+full = ["surval[encoder,db,sanity]"]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/surval"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
