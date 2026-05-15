@@ -1160,7 +1160,8 @@ def _compute_from_cache(
                 )
             lse_tau = max(float(prefix_soft_lse_tau), 1e-8)
             for t in range(t_len):
-                p_b = np.exp(-np.maximum(0.0, err_mat[:, t] - eps_s) / max(tau_ep, 1e-8))
+                p_b = np.exp(-np.maximum(0.0, err_mat[:, t] - eps_s))
+                # p_b = np.maximum(0.0, err_mat[:, t] - eps_s)
                 if soft_agg == "worst_n":
                     # N-th smallest (ascending) soft prob = N-th worst block.
                     # Aligns soft with hard's semantic: hard declares "fail at
