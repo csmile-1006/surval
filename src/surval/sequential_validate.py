@@ -49,20 +49,46 @@ from tensorboardX import SummaryWriter
 # File-discovery helpers
 # ---------------------------------------------------------------------------
 
+# Cache-mode specs: which on-disk filename glob and HDF5 attribute name to use
+# for the time-axis. Different upstream cache writers use different conventions:
+#   "step"  — surval_openpi (default): seqcache_step_*.hdf5  + f.attrs["step"]
+#   "epoch" — droid_policy_learning, custom-robomimic:
+#             seqcache_epoch_*.hdf5 + f.attrs["epoch"]
+# The internal variable name is always ``step``; the mode only controls which
+# file pattern is discovered, which HDF5 attr is read, and which key the
+# JSON/group-summary output uses.
+_CACHE_MODE_SPECS: dict[str, dict[str, str]] = {
+    "step": {"glob": "seqcache_step_*.hdf5", "attr": "step"},
+    "epoch": {"glob": "seqcache_epoch_*.hdf5", "attr": "epoch"},
+}
 
-def _get_cache_files(cache_dir):
+
+def _cache_mode_spec(mode):
+    spec = _CACHE_MODE_SPECS.get(str(mode))
+    if spec is None:
+        raise ValueError(f"Unknown cache_mode: {mode!r}; choose one of {sorted(_CACHE_MODE_SPECS)}")
+    return spec
+
+
+def _get_cache_files(cache_dir, *, mode="step"):
+    spec = _cache_mode_spec(mode)
     cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
-    paths = sorted(Path(cache_dir).glob("seqcache_step_*.hdf5"))
+    paths = sorted(Path(cache_dir).glob(spec["glob"]))
     return [str(p.resolve()) for p in paths if p.is_file()]
 
 
-def _discover_cache_groups(cache_dir):
-    """Discover dirs containing seqcache_step_*.hdf5 files, recursively."""
+def _discover_cache_groups(cache_dir, *, mode="step"):
+    """Discover dirs containing cache files for ``mode``, recursively.
+
+    ``mode`` selects the filename pattern via ``_CACHE_MODE_SPECS`` (e.g. "step"
+    matches ``seqcache_step_*.hdf5``; "epoch" matches ``seqcache_epoch_*.hdf5``).
+    """
+    spec = _cache_mode_spec(mode)
     root = Path(os.path.abspath(os.path.expanduser(cache_dir))).resolve()
     if not root.exists() or not root.is_dir():
         raise FileNotFoundError(f"cache directory not found: {root}")
     group_to_files = {}
-    for p in root.rglob("seqcache_step_*.hdf5"):
+    for p in root.rglob(spec["glob"]):
         if not p.is_file():
             continue
         key = str(p.parent.resolve())
@@ -778,13 +804,20 @@ def _compute_per_block_scaled_step_errors(
 # ---------------------------------------------------------------------------
 
 
-def _load_cache_hdf5(path, *, load_obs_features=False):
+def _load_cache_hdf5(path, *, load_obs_features=False, mode="step"):
     """
     Load one seqcache HDF5 file.
 
     ``obs_features`` is not used by sequential validation metrics; loading it
     can dominate I/O when many cache groups / large files. Default is to skip.
+
+    ``mode`` selects the HDF5 attribute used for the time axis (``step`` by
+    default; ``epoch`` for caches written by robomimic-side scripts). The
+    returned tuple's 7th element (``step``) holds the integer regardless of
+    name; -1 if the attribute is absent.
     """
+    spec = _cache_mode_spec(mode)
+    attr_name = spec["attr"]
     demo_ids = []
     index_in_demo_chunks = []
     actions_chunks = []
@@ -793,7 +826,7 @@ def _load_cache_hdf5(path, *, load_obs_features=False):
 
     with h5py.File(path, "r") as f:
         checkpoint = str(f.attrs.get("checkpoint", ""))
-        step = int(f.attrs.get("step", -1))
+        step = int(f.attrs.get(attr_name, -1))
         valid_loss = valid_off = None
         if "metrics" in f and "valid" in f["metrics"]:
             vg = f["metrics"]["valid"]
@@ -1321,33 +1354,39 @@ _SUMMARY_METRICS = [
 ]
 
 
-def _print_checkpoint_metrics(results: list, group_label: str = "", *, use_compact: bool = True) -> None:
+def _print_checkpoint_metrics(
+    results: list,
+    group_label: str = "",
+    *,
+    use_compact: bool = True,
+    time_key: str = "step",
+) -> None:
     """
     Print and return a per-metric summary across all checkpoints in a group.
 
     Organises results as::
 
-        {metric: {step: value, ...}, ...}
+        {metric: {<time_key>: value, ...}, ...}
 
     and prints both a compact JSON-style dict and a human-readable table.
 
     Args:
         results: list of per-checkpoint dicts produced by ``_run_single_cache_group``.
-            Each entry contains ``"step"``, ``"summary"`` (seq metrics), and
-            ``"valid_summary"`` ({"Loss": ..., "Off_Manifold_Norm": ...}).
+            Each entry contains ``time_key`` ("step" or "epoch"), ``"summary"``
+            (seq metrics), and ``"valid_summary"`` ({"Loss": ...,
+            "Off_Manifold_Norm": ...}).
         group_label: optional label shown in the header (e.g. relative_dir).
+        time_key: the JSON field name that holds the integer time axis.
     """
     if not results:
         return
 
-    # Sort checkpoints by step
-    sorted_results = sorted(results, key=lambda r: int(r["step"]))
-    steps = [int(r["step"]) for r in sorted_results]
+    sorted_results = sorted(results, key=lambda r: int(r[time_key]))
+    steps = [int(r[time_key]) for r in sorted_results]
 
-    # Build {metric: {step: value}} — merge seq summary and valid_summary
     per_metric: dict[str, dict[int, float]] = {m: {} for m in _SUMMARY_METRICS}
     for r in sorted_results:
-        s = int(r["step"])
+        s = int(r[time_key])
         summary = r.get("summary", {})
         vsummary = r.get("valid_summary", {})
 
@@ -1362,21 +1401,19 @@ def _print_checkpoint_metrics(results: list, group_label: str = "", *, use_compa
     header = f"\n{'=' * 72}\n[checkpoint metrics] {group_label}\n{'=' * 72}"
     print(header, flush=True)
 
-    # --- dict-of-lists for programmatic use / copy-paste into plotting ---
     if use_compact:
         compact: dict[str, list] = {}
         for m in _SUMMARY_METRICS:
             vals = [per_metric[m].get(s) for s in steps]
             compact[m] = vals
-        compact["steps"] = steps
+        compact[f"{time_key}s"] = steps
         print(json.dumps(_to_jsonable(compact), indent=2), flush=True)
 
-    # --- human-readable table ---
     col_w = 14
     step_w = 10
     active = [m for m in _SUMMARY_METRICS if any(v is not None for v in per_metric[m].values())]
 
-    header_row = f"{'step':>{step_w}}" + "".join(f"  {m[:col_w]:>{col_w}}" for m in active)
+    header_row = f"{time_key:>{step_w}}" + "".join(f"  {m[:col_w]:>{col_w}}" for m in active)
     sep = "-" * len(header_row)
     print(f"\n{header_row}\n{sep}", flush=True)
     for s in steps:
@@ -1395,12 +1432,18 @@ def _print_checkpoint_metrics(results: list, group_label: str = "", *, use_compa
 
 def _run_single_cache_group(group, args, action_space_config):
     """
-    Process one cache group (one subdir under --cache-dir with seqcache_step_*.hdf5).
-    Used sequentially or from worker processes when --num-workers > 1.
+    Process one cache group (one subdir under --cache-dir).
+
+    Filename / attr conventions follow ``args.cache_mode`` (``step`` matches
+    ``seqcache_step_*.hdf5`` + ``f.attrs["step"]``; ``epoch`` matches
+    ``seqcache_epoch_*.hdf5`` + ``f.attrs["epoch"]``). Used sequentially or
+    from worker processes when --num-workers > 1.
     """
     rel_dir = group["relative_dir"]
     group_dir = group["group_dir"]
     cache_files = group["cache_files"]
+    cache_mode = str(getattr(args, "cache_mode", "step"))
+    time_key = _cache_mode_spec(cache_mode)["attr"]  # "step" or "epoch"
     out_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     group_out_dir = out_dir if rel_dir == "." else os.path.join(out_dir, rel_dir)
     os.makedirs(group_out_dir, exist_ok=True)
@@ -1425,7 +1468,7 @@ def _run_single_cache_group(group, args, action_space_config):
             step,
             valid_loss,
             valid_off,
-        ) = _load_cache_hdf5(cache_path, load_obs_features=load_obs)
+        ) = _load_cache_hdf5(cache_path, load_obs_features=load_obs, mode=cache_mode)
         if step < 0:
             step = len(results) + 1
         seq_summary, per_episode = _compute_from_cache(
@@ -1479,7 +1522,7 @@ def _run_single_cache_group(group, args, action_space_config):
             {
                 "cache_file": cache_path,
                 "checkpoint": checkpoint,
-                "step": int(step),
+                time_key: int(step),
                 "valid_summary": {"Loss": valid_loss, "Off_Manifold_Norm": valid_off},
                 "summary": seq_summary,
                 "per_episode": per_episode,
@@ -1495,17 +1538,17 @@ def _run_single_cache_group(group, args, action_space_config):
     # print(f"\nSaved TensorBoard logs to: {tb_dir}", flush=True)
     # print(f"Saved JSON results to: {out_json}", flush=True)
 
-    _print_checkpoint_metrics(results, group_label=rel_dir, use_compact=args.use_compact)
+    _print_checkpoint_metrics(results, group_label=rel_dir, use_compact=args.use_compact, time_key=time_key)
 
-    steps = [int(x["step"]) for x in results]
+    steps = [int(x[time_key]) for x in results]
     return {
         "relative_dir": rel_dir,
         "cache_dir": group_dir,
         "output_dir": group_out_dir,
         "num_cache_files": len(cache_files),
         "num_results": len(results),
-        "step_min": int(min(steps)) if steps else None,
-        "step_max": int(max(steps)) if steps else None,
+        f"{time_key}_min": int(min(steps)) if steps else None,
+        f"{time_key}_max": int(max(steps)) if steps else None,
         "mean_prefix_survival_score": (float(np.mean(prefix_scores)) if prefix_scores else None),
         "results_json": out_json,
         "tb_dir": tb_dir,
@@ -1520,10 +1563,14 @@ def _cache_group_worker(payload):
 
 
 def run(args, action_space_config):
-    cache_groups = _discover_cache_groups(args.cache_dir)
+    cache_mode = str(getattr(args, "cache_mode", "step"))
+    cache_groups = _discover_cache_groups(args.cache_dir, mode=cache_mode)
     if not cache_groups:
+        spec = _cache_mode_spec(cache_mode)
         raise RuntimeError(
-            f"No cache files found under {args.cache_dir} (expected seqcache_step_*.hdf5 in this folder or its subfolders)."
+            f"No cache files found under {args.cache_dir} "
+            f"(expected {spec['glob']} in this folder or its subfolders; "
+            f"--cache-mode={cache_mode!r})."
         )
 
     out_dir = os.path.abspath(os.path.expanduser(args.output_dir))
@@ -1565,6 +1612,20 @@ def add_common_args(parser):
     """Add all CLI args shared between the standard and dex entry scripts."""
     parser.add_argument("--cache-dir", type=str, required=True)
     parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument(
+        "--cache-mode",
+        type=str,
+        default="step",
+        choices=sorted(_CACHE_MODE_SPECS.keys()),
+        help=(
+            "Time-axis convention for the on-disk caches. "
+            "'step': discover seqcache_step_*.hdf5 and read f.attrs['step'] "
+            "(surval_openpi default). "
+            "'epoch': discover seqcache_epoch_*.hdf5 and read f.attrs['epoch'] "
+            "(robomimic-side scripts: droid_policy_learning, custom-robomimic). "
+            "Wrappers can override the default with parser.set_defaults(cache_mode=...)."
+        ),
+    )
     parser.add_argument("--num-diffusion-samples", type=int, default=1)
     parser.add_argument("--prefix-tau", type=float, default=1.0)
     parser.add_argument(
@@ -1766,7 +1827,7 @@ def add_common_args(parser):
         default=1,
         help=(
             "Number of parallel worker processes for cache *groups* (subdirs each with "
-            "seqcache_step_*.hdf5). Default 1 (sequential). Set to the number of CPUs "
+            "seqcache_*.hdf5). Default 1 (sequential). Set to the number of CPUs "
             "you allocate (e.g. SLURM --cpus-per-task) when you have many groups; "
             "keep OMP_NUM_THREADS=1 per process to avoid BLAS oversubscription."
         ),
