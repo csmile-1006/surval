@@ -191,3 +191,138 @@ def test_fallback_when_too_few_neighbors():
     m = compute_local_thresholds(db, cfg, global_t)
     assert m.fallback_used.all()
     assert np.allclose(m.thresholds, 0.42)
+
+
+# ---------------------------------------------------------------------------
+# pos_rot6d (10-D) regression coverage
+# ---------------------------------------------------------------------------
+
+
+def _identity_rot6d() -> np.ndarray:
+    """6D representation of the identity rotation: rows [1,0,0] and [0,1,0]."""
+    return np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
+
+def _rot_z_6d(angle: float) -> np.ndarray:
+    """6D representation of rotation by ``angle`` rad about z-axis."""
+    c, s = np.cos(angle), np.sin(angle)
+    # Rows of R_z(angle): row0 = [c, -s, 0]; row1 = [s, c, 0].
+    return np.array([c, -s, 0.0, s, c, 0.0], dtype=np.float32)
+
+
+def test_block_pair_distances_rot6d_matches_geodesic_angle():
+    """rot6d block: distance between R(θ) and identity must equal |θ|."""
+    angles = np.array([0.0, 0.1, 0.5, 1.0, 1.5], dtype=np.float32)
+    M = len(angles)
+    actions = np.zeros((M, 10), dtype=np.float32)
+    # Layout: [pos(0:3)=0, rot_6d(3:9), gripper(9)=0].
+    for i, a in enumerate(angles):
+        actions[i, 3:9] = _rot_z_6d(float(a))
+    sl = slice(3, 9)
+    q = np.zeros((10,), dtype=np.float32)
+    q[3:9] = _identity_rot6d()
+    d = _block_pair_distances(
+        actions, sl, pairwise=False, query_action=q, block_type="rot6d"
+    )
+    assert d.shape == (M,)
+    assert np.allclose(d, angles, atol=1e-4), (d, angles)
+
+
+def test_block_pair_distances_rot6d_zero_when_identical():
+    """Identical rotations -> zero geodesic distance, even for pairwise mode."""
+    M = 6
+    angle = 0.7
+    actions = np.zeros((M, 10), dtype=np.float32)
+    for i in range(M):
+        actions[i, 3:9] = _rot_z_6d(angle)
+    d = _block_pair_distances(actions, slice(3, 9), pairwise=True, block_type="rot6d")
+    # All pairs identical -> all zero.
+    assert d.shape == (M * (M - 1) // 2,)
+    assert np.allclose(d, 0.0, atol=1e-4)
+
+
+def test_pos_rot6d_local_thresholds_geodesic_vs_l2():
+    """End-to-end: build a tiny 10-D state DB with a linear-in-t rot_z trajectory
+    and verify the rot_6d block threshold equals the geodesic angle (|ta·dθ|)
+    rather than the raw-L2 6D-component delta."""
+    rng = np.random.default_rng(0)
+    n_demos = 6
+    per_demo = 20
+    n = n_demos * per_demo
+    d_state = 8
+    emb = rng.normal(size=(n, d_state)).astype(np.float32)
+    emb /= np.linalg.norm(emb, axis=-1, keepdims=True)
+
+    d_theta = 0.05  # per-step rotation about z
+    d_pos = np.array([0.01, -0.02, 0.03], dtype=np.float32)  # per-step translation
+    actions = np.zeros((n, 10), dtype=np.float32)
+    demo_id_int = np.zeros(n, dtype=np.int32)
+    t_arr = np.zeros(n, dtype=np.int32)
+    for d in range(n_demos):
+        for s in range(per_demo):
+            i = d * per_demo + s
+            demo_id_int[i] = d
+            t_arr[i] = s
+            actions[i, 0:3] = s * d_pos
+            actions[i, 3:9] = _rot_z_6d(s * d_theta)
+            # gripper stays 0
+
+    rec = StateRecords(
+        actions=actions,
+        demo_id_int=demo_id_int,
+        t=t_arr,
+        demo_id_str_by_int={i: f"demo_{i}" for i in range(n_demos)},
+    )
+    cfg = LocalThresholdConfig.for_droid_action_space(
+        "pos_rot6d",
+        k_neighbors=40,
+        min_neighbors_for_local=3,
+        temporal_exclusion_radius=0,
+        same_demo_allowed=True,
+        quantiles=(0.5, 0.9, 0.99),
+        scale_source="intra_demo_sc",
+        ta=4,
+    )
+    db = StateDatabase(cfg)
+    db.attach(emb, rec)
+
+    g = compute_global_intra_demo_thresholds_from_db(db, cfg)
+    assert g.shape == (2, 3)  # 2 blocks (pos, rot_6d), 3 quantiles
+    # pos block: L2 of (ta·d_pos) — same across all chunk pairs.
+    expected_pos = float(np.linalg.norm(cfg.ta * d_pos))
+    # rot_6d block: geodesic angle = |ta * d_theta|.
+    expected_rot = float(abs(cfg.ta * d_theta))
+    for qi in range(3):
+        assert np.allclose(g[0, qi], expected_pos, atol=1e-4), (g[0, qi], expected_pos)
+        assert np.allclose(g[1, qi], expected_rot, atol=1e-4), (g[1, qi], expected_rot)
+
+    # Local pass: states with enough neighbors must match the same expected values.
+    m = compute_local_intra_demo_thresholds(db, cfg, g)
+    assert m.block_names == ("pos", "rot_6d")
+    assert m.block_types == {"rot_6d": "rot6d"}
+    for s in range(n):
+        if not bool(m.fallback_used[s]):
+            for qi in range(3):
+                assert np.allclose(m.thresholds[s, 0, qi], expected_pos, atol=1e-4)
+                assert np.allclose(m.thresholds[s, 1, qi], expected_rot, atol=1e-4)
+
+
+def test_local_threshold_map_round_trip_preserves_block_types(tmp_path):
+    """LocalThresholdMap.save -> load must preserve block_types so the
+    seqval consumer can sanity-check it against its own ACTION_SPACE."""
+    from surval.local_threshold.threshold import LocalThresholdMap
+
+    m = LocalThresholdMap(
+        thresholds=np.zeros((3, 2, 2), dtype=np.float32),
+        fallback_used=np.zeros((3,), dtype=bool),
+        n_neighbors_used=np.full((3,), 5, dtype=np.int32),
+        block_names=("pos", "rot_6d"),
+        quantiles=(0.9, 0.95),
+        global_thresholds=np.zeros((2, 2), dtype=np.float32),
+        config_hash="deadbeef",
+        block_types={"rot_6d": "rot6d"},
+    )
+    m.save(str(tmp_path))
+    loaded = LocalThresholdMap.load(str(tmp_path))
+    assert loaded.block_names == ("pos", "rot_6d")
+    assert loaded.block_types == {"rot_6d": "rot6d"}

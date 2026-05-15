@@ -5,18 +5,24 @@ state space, drop self / temporally-close same-demo neighbors, then compute
 per-block, per-quantile thresholds ``S_g^q(s_q)`` from action distances among
 those neighbors.
 
-Per user direction (2026-04-25):
-- Distance is L2 only (no rotation, no Mahalanobis).
-- Multiple quantile candidates (e.g. 0.5, 0.75, 0.9, 0.95, 0.99) are computed
-  in a single pass and stored together; the consumer chooses one at use time.
-- Global per-block-per-quantile thresholds are computed in the same pipeline
-  (using the *same* L2 + state-NN formulation, but pooled across all neighbor
-  pairs in the DB) so global and local share units and are saved together.
+Per-block distance follows ``cfg.block_types`` (matching the consumer in
+``surval.sequential_validate``):
+- default — raw L2 over the block's action slice.
+- ``"rot6d"`` — SO(3) geodesic distance over a 6D continuous rotation:
+  ``||axis_angle(R_a^T @ R_b)||``. Used for the ``rot_6d`` block in DROID's
+  10-D ``[pos, rot_6d, gripper]`` action space.
+
+Multiple quantile candidates (e.g. 0.5, 0.75, 0.9, 0.95, 0.99) are computed
+in a single pass and stored together; the consumer chooses one at use time.
+Global per-block-per-quantile thresholds are computed in the same pipeline
+(same distance formulation, pooled across all neighbor pairs in the DB) so
+global and local share units and are saved together.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field
 import json
 import os
 
@@ -24,6 +30,7 @@ import numpy as np
 
 from .config import LocalThresholdConfig
 from .database import StateDatabase
+from .rotation import rot6d_relative_delta
 
 # -------- core distance computation --------
 
@@ -34,13 +41,41 @@ def _block_pair_distances(
     *,
     pairwise: bool,
     query_action: np.ndarray | None = None,  # (action_dim,), required if not pairwise
+    block_type: str | None = None,
 ) -> np.ndarray:
-    """Per-block L2 distances among M neighbor actions.
+    """Per-block distances among M neighbor actions.
+
+    block_type:
+        None (default) — raw L2 over the block's action slice.
+        "rot6d"        — SO(3) geodesic distance over the 6D continuous
+                          rotation slice (must be 6-D), i.e.
+                          ``||axis_angle(R_a^T @ R_b)||``.
 
     pairwise=True  → upper-triangular pairwise distances, length M*(M-1)/2.
     pairwise=False → query-centered distances ||a_i - a_q||, length M.
     """
     block = actions[:, block_slice]  # (M, d_block)
+    if block_type == "rot6d":
+        if block.shape[1] != 6:
+            raise ValueError(
+                f"rot6d block must be 6-D, got slice of width {block.shape[1]}"
+            )
+        if pairwise:
+            if block.shape[0] < 2:
+                return np.empty((0,), dtype=np.float32)
+            a = block[:, None, :]  # (M, 1, 6)
+            b = block[None, :, :]  # (1, M, 6)
+            delta = rot6d_relative_delta(a, b)  # (M, M, 3) axis-angle
+            dist = np.linalg.norm(delta, axis=-1)  # (M, M)
+            iu = np.triu_indices(block.shape[0], k=1)
+            return dist[iu].astype(np.float32)
+        if query_action is None:
+            raise ValueError("query_action required for query_centered mode")
+        q_block = query_action[block_slice][None, :]  # (1, 6)
+        delta = rot6d_relative_delta(block, q_block)  # (M, 3)
+        return np.linalg.norm(delta, axis=-1).astype(np.float32)
+
+    # Default: L2 in the raw block space.
     if pairwise:
         if block.shape[0] < 2:
             return np.empty((0,), dtype=np.float32)
@@ -52,6 +87,26 @@ def _block_pair_distances(
         raise ValueError("query_action required for query_centered mode")
     q_block = query_action[block_slice][None, :]  # (1, d)
     return np.linalg.norm(block - q_block, axis=-1).astype(np.float32)
+
+
+def _block_chunk_motion_distance(
+    a_from: np.ndarray,  # (M, action_dim) or (action_dim,) — start frames
+    a_to: np.ndarray,  # (M, action_dim) or (action_dim,) — end frames (matched)
+    block_slice: slice,
+    *,
+    block_type: str | None = None,
+) -> np.ndarray:
+    """Per-block chunk-motion distance ||a_to - a_from|| on the block slice.
+
+    For ``block_type == "rot6d"`` returns the SO(3) geodesic angle of
+    ``R_from^T @ R_to`` instead of a raw Euclidean difference.
+    Returns shape ``(M,)`` (or scalar 1-D if inputs were 1-D).
+    """
+    if block_type == "rot6d":
+        delta = rot6d_relative_delta(a_from[..., block_slice], a_to[..., block_slice])
+        return np.linalg.norm(delta, axis=-1).astype(np.float32)
+    diff = a_to[..., block_slice] - a_from[..., block_slice]
+    return np.linalg.norm(diff, axis=-1).astype(np.float32)
 
 
 # -------- LocalThresholdMap --------
@@ -71,6 +126,10 @@ class LocalThresholdMap:
     quantiles: tuple[float, ...]
     global_thresholds: np.ndarray  # (n_blocks, n_quantiles) float32
     config_hash: str
+    # Per-block distance type used when computing the thresholds. Blocks not
+    # listed here used raw L2. Persisted so the consumer can sanity-check that
+    # the threshold units match its own per-block error formulation.
+    block_types: dict[str, str] = field(default_factory=dict)
 
     def get(self, state_idx: int, block: str, quantile: float) -> float:
         b = self.block_names.index(block)
@@ -103,6 +162,7 @@ class LocalThresholdMap:
                     "block_names": list(self.block_names),
                     "quantiles": list(self.quantiles),
                     "config_hash": self.config_hash,
+                    "block_types": dict(self.block_types),
                 },
                 f,
                 indent=2,
@@ -121,6 +181,9 @@ class LocalThresholdMap:
             quantiles=tuple(meta["quantiles"]),
             global_thresholds=npz["global_thresholds"],
             config_hash=meta["config_hash"],
+            # block_types is optional for backward compat with maps written
+            # before the field existed; default to empty (= all L2).
+            block_types=dict(meta.get("block_types", {})),
         )
 
 
@@ -134,18 +197,15 @@ def compute_global_thresholds_from_db(
     """Pool ALL filtered neighbor pairs across the DB into a single per-block
     distribution, then take each quantile.
 
-    Returns: (n_blocks, n_quantiles) float32.
-
-    Note: this differs from the legacy progress-window method in
-    ``base.py:_estimate_block_scales_from_expert_demos``. Per user direction
-    (compute global within the same pipeline), we use the same L2 formulation
-    as the local pass, just pooled. This guarantees units match.
+    Returns: (n_blocks, n_quantiles) float32. Per-block distance respects
+    ``cfg.block_types`` (default L2; "rot6d" = SO(3) geodesic).
     """
     if db.records is None or db.embeddings is None:
         raise RuntimeError("DB not built")
 
     n = db.n_states
     block_slices = cfg.block_slice_dict()
+    block_types = cfg.block_type_dict()
     block_names = list(cfg.block_names)
     quantiles = np.asarray(cfg.quantiles, dtype=np.float64)
 
@@ -175,6 +235,7 @@ def compute_global_thresholds_from_db(
                 block_slices[b],
                 pairwise=cfg.pairwise_or_query_centered == "pairwise",
                 query_action=actions[q] if cfg.pairwise_or_query_centered != "pairwise" else None,
+                block_type=block_types.get(b),
             )
             if d.size > 0:
                 pools[b].append(d)
@@ -195,14 +256,15 @@ def compute_local_thresholds(
 ) -> LocalThresholdMap:
     """For each state in db, compute per-block per-quantile thresholds.
 
-    States with too few valid neighbors fall back to the matching global
-    quantile.
+    Per-block distance respects ``cfg.block_types``. States with too few
+    valid neighbors fall back to the matching global quantile.
     """
     if db.records is None or db.embeddings is None:
         raise RuntimeError("DB not built")
 
     n = db.n_states
     block_slices = cfg.block_slice_dict()
+    block_types = cfg.block_type_dict()
     block_names = list(cfg.block_names)
     quantiles = np.asarray(cfg.quantiles, dtype=np.float64)
     n_blocks = len(block_names)
@@ -246,6 +308,7 @@ def compute_local_thresholds(
                 block_slices[b],
                 pairwise=pairwise,
                 query_action=q_action,
+                block_type=block_types.get(b),
             )
             if d.size == 0:
                 # No valid pairs for this block at this state — fall back per-block.
@@ -261,13 +324,14 @@ def compute_local_thresholds(
         quantiles=tuple(float(q) for q in cfg.quantiles),
         global_thresholds=global_thresholds.astype(np.float32),
         config_hash=cfg.to_hash(),
+        block_types=dict(block_types),
     )
 
 
 # -------- intra-demo (state-conditional) chunk-motion thresholds --------
 
 
-def _gather_chunk_motion_deltas(
+def _gather_chunk_motion_pairs(
     nb_idx: np.ndarray,
     *,
     actions: np.ndarray,
@@ -275,26 +339,35 @@ def _gather_chunk_motion_deltas(
     t_arr: np.ndarray,
     idx_lookup: dict[tuple[int, int], int],
     ta: int,
-) -> np.ndarray:
-    """For each neighbor j, compute ``a[idx_at(demo_j, t_j+ta)] - a[j]``.
+) -> tuple[np.ndarray, np.ndarray]:
+    """For each neighbor j, gather (a[j], a[idx_at(demo_j, t_j+ta)]) pairs.
 
-    Returns an ``(M', A)`` array of valid chunk-motion deltas, where ``M' <= M``
-    drops neighbors whose ``(demo_j, t_j+ta)`` is not present in the DB
-    (demo end, or sampling gap).
+    Returns ``(a_from, a_to)`` each shaped ``(M', A)``. ``M' <= M`` drops
+    neighbors whose ``(demo_j, t_j+ta)`` is not present in the DB (demo end,
+    or sampling gap). Returning the raw start/end actions (not the difference)
+    lets the caller pick a per-block distance, including SO(3) geodesic on
+    rot6d blocks where raw subtraction would lose the rotation structure.
     """
     if nb_idx.size == 0:
-        return np.empty((0, actions.shape[1]), dtype=np.float32)
-    deltas: list[np.ndarray] = []
+        empty = np.empty((0, actions.shape[1]), dtype=np.float32)
+        return empty, empty
+    a_from: list[np.ndarray] = []
+    a_to: list[np.ndarray] = []
     for j in nb_idx:
         d_j = int(demo_id_int[j])
         t_j_next = int(t_arr[j]) + int(ta)
         nxt = idx_lookup.get((d_j, t_j_next))
         if nxt is None:
             continue
-        deltas.append(actions[nxt] - actions[j])
-    if not deltas:
-        return np.empty((0, actions.shape[1]), dtype=np.float32)
-    return np.stack(deltas, axis=0).astype(np.float32)
+        a_from.append(actions[j])
+        a_to.append(actions[nxt])
+    if not a_from:
+        empty = np.empty((0, actions.shape[1]), dtype=np.float32)
+        return empty, empty
+    return (
+        np.stack(a_from, axis=0).astype(np.float32),
+        np.stack(a_to, axis=0).astype(np.float32),
+    )
 
 
 def _intra_demo_sc_neighbors(
@@ -329,7 +402,8 @@ def compute_global_intra_demo_thresholds_from_db(
     Same units as ``_estimate_block_scales_from_intra_demo_diffs`` (the seqval
     ``intra_demo`` mode), but the pool is only the union of state-NN neighbors'
     deltas — i.e. state-conditional only at the population level. Local pass
-    additionally restricts the pool to each query's own neighbors.
+    additionally restricts the pool to each query's own neighbors. Per-block
+    distance respects ``cfg.block_types``.
 
     Returns: ``(n_blocks, n_quantiles)`` float32.
     """
@@ -337,6 +411,7 @@ def compute_global_intra_demo_thresholds_from_db(
         raise RuntimeError("DB not built")
 
     block_slices = cfg.block_slice_dict()
+    block_types = cfg.block_type_dict()
     block_names = list(cfg.block_names)
     quantiles = np.asarray(cfg.quantiles, dtype=np.float64)
 
@@ -349,7 +424,7 @@ def compute_global_intra_demo_thresholds_from_db(
 
     pools: dict[str, list[np.ndarray]] = {b: [] for b in block_names}
     for q in range(db.n_states):
-        deltas = _gather_chunk_motion_deltas(
+        a_from, a_to = _gather_chunk_motion_pairs(
             filtered[q],
             actions=actions,
             demo_id_int=demo_id_int,
@@ -357,11 +432,12 @@ def compute_global_intra_demo_thresholds_from_db(
             idx_lookup=idx_lookup,
             ta=ta,
         )
-        if deltas.shape[0] == 0:
+        if a_from.shape[0] == 0:
             continue
         for b in block_names:
-            sl = block_slices[b]
-            d = np.linalg.norm(deltas[:, sl], axis=-1).astype(np.float32)
+            d = _block_chunk_motion_distance(
+                a_from, a_to, block_slices[b], block_type=block_types.get(b)
+            )
             pools[b].append(d)
 
     out = np.zeros((len(block_names), len(quantiles)), dtype=np.float32)
@@ -393,6 +469,7 @@ def compute_legacy_intra_demo_thresholds_from_db(
         raise RuntimeError("DB not built")
 
     block_slices = cfg.block_slice_dict()
+    block_types = cfg.block_type_dict()
     block_names = list(cfg.block_names)
     quantiles = np.asarray(cfg.quantiles, dtype=np.float64)
     actions = db.records.actions
@@ -409,19 +486,24 @@ def compute_legacy_intra_demo_thresholds_from_db(
         ts_sorted = sorted(t_to_idx.keys())
         if len(ts_sorted) <= ta:
             continue
-        deltas = []
+        a_from_list: list[np.ndarray] = []
+        a_to_list: list[np.ndarray] = []
         for t in ts_sorted:
             j_next = t_to_idx.get(t + ta)
             if j_next is None:
                 continue
             j_cur = t_to_idx[t]
-            deltas.append(actions[j_next] - actions[j_cur])
-        if not deltas:
+            a_from_list.append(actions[j_cur])
+            a_to_list.append(actions[j_next])
+        if not a_from_list:
             continue
-        d_arr = np.stack(deltas, axis=0).astype(np.float32)
+        a_from = np.stack(a_from_list, axis=0).astype(np.float32)
+        a_to = np.stack(a_to_list, axis=0).astype(np.float32)
         for b in block_names:
-            sl = block_slices[b]
-            pools[b].append(np.linalg.norm(d_arr[:, sl], axis=-1).astype(np.float32))
+            d = _block_chunk_motion_distance(
+                a_from, a_to, block_slices[b], block_type=block_types.get(b)
+            )
+            pools[b].append(d)
 
     out = np.zeros((len(block_names), len(quantiles)), dtype=np.float32)
     for bi, b in enumerate(block_names):
@@ -455,6 +537,7 @@ def compute_local_intra_demo_thresholds(
 
     n = db.n_states
     block_slices = cfg.block_slice_dict()
+    block_types = cfg.block_type_dict()
     block_names = list(cfg.block_names)
     quantiles = np.asarray(cfg.quantiles, dtype=np.float64)
     n_blocks = len(block_names)
@@ -476,7 +559,7 @@ def compute_local_intra_demo_thresholds(
     n_neighbors_used = np.zeros((n,), dtype=np.int32)
 
     for qi in range(n):
-        deltas = _gather_chunk_motion_deltas(
+        a_from, a_to = _gather_chunk_motion_pairs(
             filtered[qi],
             actions=actions,
             demo_id_int=demo_id_int,
@@ -484,14 +567,15 @@ def compute_local_intra_demo_thresholds(
             idx_lookup=idx_lookup,
             ta=ta,
         )
-        n_neighbors_used[qi] = deltas.shape[0]
-        if deltas.shape[0] < min_nb:
+        n_neighbors_used[qi] = a_from.shape[0]
+        if a_from.shape[0] < min_nb:
             fallback[qi] = True
             thresholds[qi] = global_thresholds
             continue
         for bi, b in enumerate(block_names):
-            sl = block_slices[b]
-            d = np.linalg.norm(deltas[:, sl], axis=-1).astype(np.float32)
+            d = _block_chunk_motion_distance(
+                a_from, a_to, block_slices[b], block_type=block_types.get(b)
+            )
             thresholds[qi, bi, :] = np.quantile(d, quantiles).astype(np.float32)
 
     return LocalThresholdMap(
@@ -502,4 +586,5 @@ def compute_local_intra_demo_thresholds(
         quantiles=tuple(float(q) for q in cfg.quantiles),
         global_thresholds=global_thresholds.astype(np.float32),
         config_hash=cfg.to_hash(),
+        block_types=dict(block_types),
     )

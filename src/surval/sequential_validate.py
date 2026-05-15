@@ -594,6 +594,7 @@ def _resolve_scales_per_row(
     expert_block_scales=None,
     state_db_dir=None,
     threshold_quantile=None,
+    action_space_block_types=None,
 ):
     """Resolve per-row, per-block divisors for ``_compute_per_block_scaled_step_errors``.
 
@@ -638,6 +639,19 @@ def _resolve_scales_per_row(
         raise ValueError(
             f"block_names mismatch: cache action space has {list(block_names)}, threshold map has {list(m.block_names)}"
         )
+    # If the threshold map advertises per-block distance types, require them to
+    # match the consumer's action-space config so we don't compare e.g. an L2
+    # threshold against a geodesic per-block error.
+    if getattr(m, "block_types", None):
+        consumer_types = {
+            k: v for k, v in (action_space_block_types or {}).items() if v
+        }
+        map_types = {k: v for k, v in dict(m.block_types).items() if v}
+        if consumer_types != map_types:
+            raise ValueError(
+                "block_types mismatch between threshold map and consumer ACTION_SPACE: "
+                f"map={map_types}, consumer={consumer_types}"
+            )
     if threshold_quantile is None:
         raise ValueError(f"--threshold-quantile is required when --block-scale-method={method!r}")
     qi = m.quantile_index(float(threshold_quantile))
@@ -991,6 +1005,7 @@ def _compute_from_cache(
         expert_block_scales=expert_block_scales,
         state_db_dir=state_db_dir,
         threshold_quantile=threshold_quantile,
+        action_space_block_types=block_types,
     )
 
     num_blocks = len(block_names)

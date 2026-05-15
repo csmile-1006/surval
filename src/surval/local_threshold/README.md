@@ -27,11 +27,19 @@ threshold artifacts (per state, per block, per quantile)
 
 ## Phase 0 — assumptions baked into this implementation
 
-- **Action**: DROID 8-D `[joint_velocity (7), gripper (1)]`. Block grouping
-  matches `DROID_ACTION_SPACE` in
-  `scripts/sequential_validate_from_cache_droid.py`: 7 single-dim joint blocks
-  (`joint_0..joint_6`), gripper excluded from blocks.
-- **Distance**: per-block L2 only (no rotation, no Mahalanobis).
+- **Action layouts** (selected via `--droid-action-space`):
+  - `joint_velocity` / `joint_position` — DROID 8-D
+    `[joint (7), gripper (1)]`. 7 single-dim joint blocks
+    (`joint_0..joint_6`), gripper excluded. Per-block distance is L2.
+  - `pos_rot6d` — DROID 10-D `[pos (3), rot_6d (6), gripper (1)]`. Blocks
+    are `pos` (L2 on 3-D translation) and `rot_6d` (SO(3) geodesic on the
+    6-D continuous rotation, matching the consumer in
+    `surval.sequential_validate`). Matches `DROID_ACTION_SPACE` in
+    `droid_policy_learning`'s `sequential_validate_from_cache_droid.py`.
+- **Distance dispatch**: blocks default to L2; `cfg.block_types["rot_6d"] =
+  "rot6d"` selects geodesic distance for the rotation block. Add new block
+  types by extending `_block_pair_distances` / `_block_chunk_motion_distance`
+  in `threshold.py`.
 - **Image views**: `image` (exterior_image_1_left) + `wrist_image`
   (wrist_image_left), 2 views.
 - **Proprio**: `joint_position` (7) + `cartesian_position` (6) +
@@ -60,9 +68,15 @@ downloads weights to `~/.cache/torch/hub/`.
 python scripts/build_state_db.py \
     --data-dir /path/to/tfds_root \
     --dataset-name droid \
+    --droid-action-space joint_velocity \   # or pos_rot6d for DROID 10-D
     --max-samples 5000 \
     --cache-root ./cache/local_threshold
 ```
+
+`--droid-action-space` controls action_dim / block_names / block_slices /
+block_types via the preset table in `config._action_space_block_spec`. Use
+`pos_rot6d` to build a state DB whose thresholds line up with
+`droid_policy_learning`'s 10-D `DROID_ACTION_SPACE`.
 
 Outputs go to `<cache-root>/<config_hash>/`. The hash is computed from every
 field of `LocalThresholdConfig`, so any change to encoder / image_size /
@@ -127,4 +141,4 @@ s_global = m.get_global(block="joint_3", quantile=0.95)
 - Phase 4 (closed-loop validation).
 - Modifications to global threshold computation in
   `sequential_validate_from_cache_base.py` (left untouched).
-- 14-D / 24-D action spaces (DROID 8-D only).
+- 14-D / 24-D action spaces (DROID 8-D and 10-D `pos_rot6d` only).
