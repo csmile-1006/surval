@@ -1,22 +1,70 @@
 # surval
 
-Shared library for sequential-validation-from-cache metrics, state-conditional
-threshold tooling, and the canonical HDF5 cache format that ties the two together.
+**Sequential validation from cached policy rollouts** — a shared library for
+ranking training checkpoints by how well a policy's predicted actions survive
+against the ground-truth trajectory, *without running the environment*. It also
+ships the state-conditional thresholding and the canonical HDF5 cache format
+that make those scores comparable across frameworks.
 
-Consumed by:
+New here? Read this page top-to-bottom. Deep API reference lives in
+[`docs/REFERENCE.md`](docs/REFERENCE.md) and
+[`src/surval/local_threshold/README.md`](src/surval/local_threshold/README.md).
 
-- `surval_openpi` — DROID/openpi sequential-validation pipeline
-- `custom-robomimic` — gripper / dex / humanoid sequential-validation wrappers
+---
 
-## Install
+## 1. What surval is for
 
-The library is published from this GitHub repo and pinned in each downstream
-project by commit SHA so behavior changes always require an explicit bump.
+You train a policy and, at each checkpoint, dump the policy's predicted actions
+next to the ground-truth actions into an **HDF5 cache**. surval reads that cache
+and computes a **PrefixSurvival score** — the headline metric — that tells you
+which checkpoint / hyper-parameter is best, with no simulator in the loop.
 
-**uv project (e.g. `surval_openpi`):**
+surval is **only a library**. It never trains a policy and never talks to a
+simulator. Two downstream projects produce caches and call into surval:
+
+| Consumer | Stack | What it does |
+|---|---|---|
+| **`surval_openpi`** | JAX / openpi | DROID two-arm sequential-validation pipeline |
+| **`custom-robomimic`** | PyTorch / robomimic | gripper / dex / humanoid wrappers |
+
+The two consumers use surval **slightly differently** (install path + cache time
+convention). Section 4 is the part you must not skip.
+
+The **lean core** of surval is the PrefixSurvival metric. A handful of older
+baseline proxies (validation loss, off-manifold norm, action MSE) are kept
+around but are treated as **legacy** and documented separately in §10 — they are
+*not* required for the main path.
+
+---
+
+## 2. The pieces you will touch
+
+```
+producer  ──►  HDF5 cache  ──►  surval reader  ──►  per-ckpt scores  ──►  multi-seed
+(your repo)    seqcache_*.hdf5   sequential_validate    JSON / TB           aggregate
+                                                                            vs. success rate
+```
+
+1. **Produce** — in *your* training repo, after a validation pass, call
+   `surval.cache_io.write_seqcache_hdf5(...)` to write one cache file per
+   checkpoint (§6).
+2. **Score** — point `surval.sequential_validate` at a cache directory to get a
+   PrefixSurvival score per checkpoint (§7).
+3. **Aggregate** — the `scripts/` in this repo collapse many seeds / HPs / tasks
+   into summary tables and **correlate the score against real success rate**
+   (§8–9).
+
+---
+
+## 3. Install
+
+surval is published from this GitHub repo and **pinned by commit SHA** in each
+downstream project, so a behavior change always requires an explicit bump.
+
+### `surval_openpi` (uv project)
 
 ```toml
-# pyproject.toml
+# surval_openpi/pyproject.toml
 [project]
 dependencies = ["surval", ...]
 
@@ -24,220 +72,163 @@ dependencies = ["surval", ...]
 surval = { git = "https://github.com/csmile-1006/surval.git", rev = "<sha>" }
 ```
 
-Then `uv sync` from the project root.
+```bash
+uv sync   # from the surval_openpi root
+```
 
-**conda / pip env (e.g. the `dmg` env used by `custom-robomimic`):**
+### `custom-robomimic` (conda / pip env, e.g. the `dmg` env)
 
 ```bash
 pip install --upgrade --force-reinstall --no-deps \
   "surval @ git+https://github.com/csmile-1006/surval.git@<sha>"
 ```
 
-`--no-deps` avoids re-resolving heavyweight transitive deps (torch, sklearn)
-that the host env already manages.
+`--no-deps` keeps pip from re-resolving heavyweight transitive deps (torch,
+sklearn) the conda env already owns.
 
-**Local editable (for surval development only):**
+### Developing surval itself
 
 ```bash
-pip install -e /home/changyeon/workspace/surval[full]
+pip install -e /home/changyeon/workspace/surval[full,dev]
+pytest tests/ -v
 ```
 
-### Extras
-
-- `encoder` — pulls in `torch`; required by `surval.local_threshold.encoder.FrozenImageEncoder`
-- `db` — pulls in `faiss-cpu`; used lazily inside `surval.local_threshold.database`
-- `sanity` — pulls in `matplotlib`; used by `surval.local_threshold.sanity` plot helpers
-- `omn` — pulls in `scikit-learn`; required by `surval.cache_io.compute_off_manifold_norm`
-- `full` — all of the above
-- `dev` — `pytest` for the test suite
-
-## Modules
-
-| Module | Purpose |
-|---|---|
-| `surval.cache_io` | Canonical HDF5 cache writer + helpers shared by every cache producer |
-| `surval.sequential_validate` | Reads caches, computes prefix-survival / per-block scaled error metrics |
-| `surval.local_threshold` | State-conditional threshold maps (`local`, `global_db`, `intra_demo_sc` modes) |
-| `surval.scale_estimation`, `surval.surval`, `surval.gates` | Regime-conditioned scale lookup and gate functions |
+**Optional extras:** `encoder` (torch — image encoder), `db` (faiss — state
+database), `omn` (scikit-learn — *legacy* off-manifold norm), `sanity`
+(matplotlib), `full` (all), `dev` (pytest).
 
 ---
 
-## `surval.cache_io` — canonical HDF5 cache I/O
+## 4. surval_openpi vs. robomimic — the differences that bite
 
-The cache producers in `surval_openpi` (JAX/openpi) and `custom-robomimic`
-(PyTorch/robomimic) used to maintain their own near-duplicate writers, with
-subtle schema drift that left robomimic-produced caches partially invisible
-to the surval reader. `cache_io` centralizes the writer and the I/O helpers
-both producers need so the schema lives in one place.
+surval supports a **step-indexed** and an **epoch-indexed** cache convention.
+openpi counts training *steps*; robomimic counts *epochs*. Get this wrong and
+the reader silently finds **zero** cache files.
 
-### Canonical HDF5 schema
+| | `surval_openpi` (openpi) | `custom-robomimic` (robomimic) |
+|---|---|---|
+| Install | uv git-source pin → `uv sync` | `pip install --no-deps git+...@<sha>` |
+| Cache filename | `seqcache_step_{step:06d}.hdf5` | `seqcache_epoch_{epoch:06d}.hdf5` |
+| Time attr in HDF5 | `f.attrs["step"]` | `f.attrs["epoch"]` |
+| Reader flag | `--cache-mode step` (**default**) | `--cache-mode epoch` |
+| Wrapper scripts live in | `surval_openpi/scripts/` | `custom-robomimic/robomimic/scripts/` |
+| Action space config | DROID two-arm | gripper / dex / humanoid |
+
+Two practical rules:
+
+- **Producer side:** the integer you write is a step *or* an epoch — the reader
+  only requires that the **filename, the time attr, and `--cache-mode` agree**.
+- **Reader side:** robomimic callers pass `--cache-mode epoch` (or set
+  `parser.set_defaults(cache_mode="epoch")` in their wrapper). openpi relies on
+  the `step` default.
+
+---
+
+## 5. Cache file schema (what the HDF5 must contain)
+
+Every cache file follows **one canonical HDF5 layout**. The reader is strict —
+missing a required group/dataset raises. Below, `A`, `T`, `S`, `N`, `F` are
+**variables** that change per run (action space, horizon, sampling, dataset
+size, feature dim) — never hard-code them.
+
+| Symbol | Meaning | Stored as |
+|---|---|---|
+| `A` | action dimension | `attrs["ac_dim"]` |
+| `T` | action horizon (timesteps per row) | `attrs["num_steps"]` |
+| `S` | number of prediction samples | `attrs["num_cache_samples"]` |
+| `N` | total rows across all demos | `attrs["num_rows"]` |
+| `F` | obs-feature dimension | `attrs["obs_feat_dim"]` |
+
+### Required layout (lean core — what the surval metric needs)
 
 ```
-File attrs:
-  checkpoint        : str    (path or step descriptor)
-  step              : int    (training step, or epoch for epoch-based frameworks)
-  num_cache_samples : int
-  num_rows          : int
-  num_steps         : int    (T, the action horizon)
-  ac_dim            : int
-  val_loss          : float  (NaN if not measured)
-  has_obs_features  : int    (0/1)
-  obs_feat_dim      : int    (0 if absent)
-
-data/                            (group; attr "total" = num_rows)
-  demo_<i>/                      (i = enumerated index 0..D-1, sorted)
-    attrs:
-      demo_id     : str          (original ID from the dataset)
-      num_samples : int
-    datasets:
-      index_in_demo : int64   [N_demo]
-      actions       : float32 [N_demo, T, A]
-      pred_actions  : float32 [S, N_demo, T, A]
-      obs_features  : float32 [N_demo, F] or [N_demo, T, F]   (optional)
-
-metrics/valid/
-  Loss : float64                                (scalar; NaN if not measured)
-  off_manifold_norm/                            (group, optional)
-    sample_<k> : float64                        (one per cache sample)
+/                                          (file root)
+├── attrs
+│   ├── checkpoint        : str    checkpoint path / descriptor
+│   ├── step  OR  epoch    : int    time-axis index (§4)
+│   ├── ac_dim            : int    = A
+│   ├── num_steps         : int    = T
+│   ├── num_cache_samples : int    = S
+│   ├── num_rows          : int    = N
+│   ├── has_obs_features  : int    = 1   (REQUIRED — always present)
+│   └── obs_feat_dim      : int    = F
+│
+└── data/                              attrs: total = N
+    ├── demo_0/                        attrs: num_samples = N_0, demo_id (opt)
+    │   ├── actions       float32  [N_0, T, A]      ground-truth actions   (REQUIRED)
+    │   ├── pred_actions  float32  [S, N_0, T, A]   predicted, S samples    (REQUIRED)
+    │   ├── index_in_demo int64    [N_0]            row order within demo   (REQUIRED)
+    │   └── obs_features  float32  [N_0, F]         state features          (REQUIRED)
+    ├── demo_1/ ...
+    └── demo_<D-1>/
 ```
 
-### Filename convention
+**`obs_features` is required.** It powers the state-conditional threshold /
+scale-estimation modes (`local`, `global_db`, `intra_demo_sc`) that surval's
+method relies on (`[N_i, F]`, or `[N_i, T, F]` which the reader collapses to the
+first timestep). Every current cache writes it (`has_obs_features = 1`).
 
-Cache files **must** be named `seqcache_step_{step:06d}.hdf5` so they are
-auto-discovered by `surval.sequential_validate._find_caches_in_dir`. For
-frameworks that count by epoch (robomimic), pass `step=epoch` to the writer
-and use the same naming pattern — the reader doesn't care what the integer
-means semantically.
+### Hard rules the reader enforces
 
-### Public API
+- **Dims must be exact:** `actions` is 3-D `[N_i, T, A]`; `pred_actions` is 4-D
+  `[S, N_i, T, A]` (a 3-D `[N_i, T, A]` is auto-wrapped to `S = 1`). Otherwise
+  `ValueError`.
+- **Lengths must agree per demo:**
+  `index_in_demo.shape[0] == actions.shape[0] == pred_actions.shape[1] == obs_features.shape[0]`.
+- **Demo keys** sort numerically (`demo_0, demo_1, ...`); the `demo_id` attr, if
+  present, overrides the displayed id.
+- **Filename ↔ attr ↔ flag must agree** (§4). Mismatch ⇒ 0 files found, or the
+  time index reads back as `-1`.
 
-| Symbol | Purpose |
-|---|---|
-| `write_seqcache_hdf5(out_path, *, demo_ids, index_in_demo, actions, pred_actions_list, checkpoint, step, val_loss=None, off_manifold_norms=None, obs_features=None)` | Writes the canonical schema. `pred_actions_list` is a sequence of `[N, T, A]` arrays (one per cache sample). `off_manifold_norms` accepts `dict[int, float]`, a single scalar (treated as `{0: scalar}`), or `None`. |
-| `sort_demo_keys(keys)` | Sort `demo_<n>` / `row_<n>` keys numerically; lexicographic fallback. |
-| `concat_trim_time(arr_list)` | Concatenate `[B, T_i, A_i]` arrays along `B` after trimming to common min `T`/`A`. |
-| `concat_trim_time_feature(arr_list)` | Same but for `[B, T_i, F_i]` feature arrays. |
-| `group_rows_by_demo(demo_ids, index_in_demo)` | `{demo_id: row_indices_sorted_by_index_in_demo}`. |
-| `ReservoirSampler(capacity, *, slots, rng_seed)` | Bounded uniform sampling for parallel arrays. |
-| `compute_off_manifold_norm(pred, state_feats, expert, k=5)` | Mean projection error onto k-NN expert action span. Requires `scikit-learn` (the `omn` extra). |
-| `compute_off_manifold_errors(...)` | Same metric, returned per-sample (no mean). |
+> Legacy proxy blocks (`metrics/valid/...`) are **not** part of the lean schema;
+> see §10.
 
-### Producer-side example
+---
 
-A minimal cache-producer loop using the unified writer:
+## 6. Producing a cache
+
+In your training repo, after one validation pass:
 
 ```python
 import numpy as np
-from surval.cache_io import (
-    ReservoirSampler,
-    compute_off_manifold_norm,
-    write_seqcache_hdf5,
-)
+from surval.cache_io import write_seqcache_hdf5
 
-# Collect predictions across one validation pass.
-gt_chunks: list[np.ndarray] = []           # [B, T, A] per batch
-pred_chunks: list[list[np.ndarray]] = [[] for _ in range(num_cache_samples)]
-demo_ids_all: list[str] = []
-index_in_demo_all: list[int] = []
-omn_sampler = ReservoirSampler(
-    capacity=65536,
-    slots=("feat", "gt", "pred"),
-    rng_seed=seed,
-)
-
-for batch in valid_loader:
-    pred_samples, gt, demo_ids, idx_in_demo, state_feats = run_inference(batch)
-    gt_chunks.append(gt)
-    for s in range(num_cache_samples):
-        pred_chunks[s].append(pred_samples[s])
-    demo_ids_all.extend(demo_ids)
-    index_in_demo_all.extend(idx_in_demo)
-    for i in range(gt.shape[0]):
-        omn_sampler.observe(feat=state_feats[i], gt=gt[i], pred=pred_samples[0][i])
-
-actions = np.concatenate(gt_chunks, axis=0)
-pred_actions_list = [np.concatenate(p, axis=0) for p in pred_chunks]
-
-# Off-manifold norm on a uniform random subset of the dataset.
-omn_data = omn_sampler.collect()
-off_manifold_norms = {
-    0: compute_off_manifold_norm(
-        np.stack(omn_data["pred"]).reshape(len(omn_data["pred"]), -1),
-        np.stack(omn_data["feat"]),
-        np.stack(omn_data["gt"]).reshape(len(omn_data["gt"]), -1),
-        k=5,
-    )
-}
-
+# `step` (openpi) or `epoch` (robomimic) — must match filename + --cache-mode (§4)
 write_seqcache_hdf5(
-    f"/path/to/cache/seqcache_step_{step:06d}.hdf5",
-    demo_ids=np.array(demo_ids_all),
-    index_in_demo=np.array(index_in_demo_all, dtype=np.int64),
-    actions=actions,
-    pred_actions_list=pred_actions_list,
+    f"/path/to/cache/seqcache_step_{step:06d}.hdf5",   # ..._epoch_... for robomimic
+    demo_ids=np.array(demo_ids_all),           # [N] str, one per row
+    index_in_demo=np.array(idx_all, np.int64), # [N]
+    actions=actions,                           # [N, T, A] ground truth
+    pred_actions_list=pred_actions_list,       # list of S arrays, each [N, T, A]
+    obs_features=obs_features,                 # [N, F] REQUIRED
     checkpoint="/path/to/checkpoint",
     step=step,
-    val_loss=val_loss,
-    off_manifold_norms=off_manifold_norms,
 )
 ```
 
-### Reader-side example
+`write_seqcache_hdf5` regroups the flat `[N, ...]` arrays into `data/demo_<i>/`
+by `demo_ids` and writes the canonical schema. A complete producer loop is in
+[`docs/REFERENCE.md`](docs/REFERENCE.md#producer-side-example).
 
-The cache is consumed by `surval.sequential_validate`:
-
-```python
-from surval.sequential_validate import _load_cache_hdf5
-
-(
-    demo_ids,         # [N] str
-    index_in_demo,    # [N] int64
-    actions,          # [N, T, A] float32
-    pred_samples,     # [S, N, T, A] float32 (always 4D — single-sample auto-wrapped)
-    obs_features,     # [N, F] float32 or None
-    checkpoint,       # str
-    step,             # int (-1 if attr missing)
-    valid_loss,       # float (NaN if not measured)
-    valid_off,        # float or None (only sample_0 exposed by the reader)
-) = _load_cache_hdf5("/path/to/seqcache_step_000042.hdf5")
-```
-
-For full sequential-validation metrics, use the wrapper-script entry-point
-trio described in the next section.
-
-### Migration notes
-
-If you still have caches from the pre-unification era, two formats need
-patching to be readable by the surval reader:
-
-```bash
-# 1. Robomimic used to name caches seqcache_epoch_*.hdf5; rename to step:
-for f in seqcache_epoch_*.hdf5; do
-    mv "$f" "${f/epoch_/step_}"
-done
-
-# 2. Robomimic used to write a flat metrics/valid/Off_Manifold_Norm scalar.
-# The reader reads only metrics/valid/off_manifold_norm/sample_<k>. Any
-# OMN values stored in the old format are silently dropped — regenerate
-# the cache to recover them.
-```
+> Older callers also passed `val_loss=` / `off_manifold_norms=`; those feed the
+> **legacy** proxy block (§10) and are optional for the surval metric.
 
 ---
 
-## `surval.sequential_validate` — metrics from a cache directory
+## 7. Scoring a cache → the surval metric
 
-Per-action-space wrappers (in `surval_openpi/scripts/` and
-`custom-robomimic/robomimic/scripts/`) compose this module's entry-point trio
-to turn a directory of `seqcache_step_*.hdf5` files into JSON summaries and
-TensorBoard scalars:
+The reader is exposed through an entry-point trio your wrapper composes
+(`surval.sequential_validate`). The wrappers themselves live in the consumer
+repos (`surval_openpi/scripts/`, `custom-robomimic/robomimic/scripts/`); a
+minimal one is just:
 
 ```python
 import argparse
 from surval.sequential_validate import add_common_args, run, validate_common_args
 
-ACTION_SPACE = {
+ACTION_SPACE = {                 # define once per action space (DROID, gripper, dex, ...)
     "action_dim": 14,
-    "block_names": [...],
+    "block_names": [...],        # e.g. ["pos", "rot_6d", "grip"] per arm
     "block_slices": {...},
     "block_dims": {...},
     "arm_pairs": [...],
@@ -246,31 +237,232 @@ ACTION_SPACE = {
 }
 
 def main():
-    parser = argparse.ArgumentParser(...)
+    parser = argparse.ArgumentParser()
     add_common_args(parser)
+    # robomimic wrappers add: parser.set_defaults(cache_mode="epoch")
     args = parser.parse_args()
     validate_common_args(args, num_blocks=len(ACTION_SPACE["block_names"]))
     run(args, ACTION_SPACE)
+
+if __name__ == "__main__":
+    main()
 ```
 
-`add_common_args` exposes `--cache-dir`, `--output-dir`, `--block-scale-method`
-(including `local`, `global_db`, `intra_demo_sc`), `--state-db-dir`,
-`--threshold-quantile`, plus the prefix-survival hyperparameters.
+Run it against a directory of caches:
+
+```bash
+# openpi
+python -m your_wrapper --cache-dir /path/to/caches --output-dir /path/to/out
+
+# robomimic
+python -m your_wrapper --cache-dir /path/to/caches --output-dir /path/to/out \
+    --cache-mode epoch
+```
+
+**Output.** `run()` discovers every `seqcache_*.hdf5` under `--cache-dir`,
+scores each, and writes one JSON file:
+
+```
+<output-dir>/sequential_validation_from_cache_group_summary.json
+```
+
+Each entry is a per-cache-group summary. The headline field is
+**`PrefixSurvival_Score`** (higher = better; the policy's predicted action
+prefixes stay inside the per-block scaled-error thresholds longer). Companion
+fields include `PrefixSurvival_Loss = 1 - score`,
+`PrefixSurvival_MatchedPrefixLen_MeanPerTraj`, and per-step action errors.
+
+Key flags from `add_common_args`: `--cache-dir`, `--output-dir`,
+`--cache-mode {step,epoch}`,
+`--block-scale-method {raw,local,global_db,intra_demo_sc}`,
+`--prefix-mode {soft,hard}`, `--threshold-quantile`, plus the ablation knobs
+`--scale-groups-mode {grouped,flat}` and `--prefix-time-reduction {product,mean}`
+(`tests/ablation_test.py`).
+
+The consumer wrappers additionally log the score to TensorBoard as
+`SequentialValid/PrefixSurvival_Score` across checkpoints — that scalar series is
+what the aggregation pipeline below consumes.
 
 ---
 
-## `surval.local_threshold` — state-conditional threshold maps
+## 8. Aggregating across seeds (e.g. robomimic, 10 seeds)
 
-```python
-from surval.local_threshold.threshold import LocalThresholdMap
-from surval.local_threshold.config import LocalThresholdConfig
-from surval.local_threshold.database import StateDatabase, StateRecords
-from surval.local_threshold.encoder import FrozenImageEncoder  # needs the `encoder` extra
+A single seed gives one score curve over checkpoints. To get a stable estimate
+you aggregate across seeds. The `scripts/` here read **TensorBoard scalars**
+(from both the training run and the seqval run), cache them to JSON once, then
+compute per-seed metrics and bootstrap a confidence interval across seeds.
+
+Expected layout (one subdir per seed, on both sides):
+
+```
+<train_root_dir>/<seed>/...            # training TB: success rate, val loss, ...
+<eval_root_dir>/<seed>/<hp_dir>/<cache_group_dir>/...   # seqval TB: PrefixSurvival_Score
 ```
 
-These back the `local` / `global_db` / `intra_demo_sc` modes of the
-`--block-scale-method` flag. See `src/surval/local_threshold/README.md` for
-build / query workflow.
+### Step 1 — extract scalars once into a JSON cache
+
+```bash
+python scripts/extract_tb_scalars.py \
+    --train_root_dir <train_root_dir> \
+    --eval_root_dir  <eval_root_dir> \
+    --cache_dir      <cache_dir>
+```
+
+This walks every seed's TB event files and writes
+`<cache_dir>/train/<seed>.json` and `<cache_dir>/eval/<seed>/<hp>/<group>.json`,
+so later metric sweeps never re-read the (slow) event files.
+
+### Step 2 — aggregate across seeds
+
+```bash
+python scripts/aggregate_seqval_hparams.py \
+    --train_root_dir <train_root_dir> \
+    --eval_root_dir  <eval_root_dir> \
+    --cache_dir      <cache_dir> \
+    --train_tag      "Valid/Loss"  --train_tag_is_rate false \
+    --seqval_tag     "SequentialValid/PrefixSurvival_Score" \
+    --out_json out/agg.json --out_csv out/agg.csv
+```
+
+For each `(HP, seqval_tag)` it computes per-seed metrics, averages over the
+**common seeds** present in both roots, and bootstraps a 95% CI
+(`--num_boot`, `--ci_level`). `bootstrap_ci_of_mean` and
+`leave_one_seed_out_stats` (`--report_loo`) live in
+`surval.tb_aggregate.metrics`.
+
+For a per-task rollup over many tasks/datasets, the higher-level drivers wrap
+this: `run_our_method_per_task.py` → `summarize_our_method.py` /
+`report_task_dataset.py`, and `summarize_ablation.py` for the leave-one-out
+ablations. Each has `--help`.
+
+---
+
+## 9. Correlating the score against **real success rate**
+
+The point of the PrefixSurvival score is to *predict* real-world success without
+rollouts. To measure how good a predictor it is, feed the **actual success
+rate** as the ground-truth signal `A` and the seqval score as the proxy `B`; the
+metrics quantify how well `B` ranks checkpoints the way `A` does.
+
+The success rate is read from the **training TB** as a scalar series over
+checkpoints (one value per checkpoint), e.g.
+`Rollout/Success_Rate/<TaskName>-mean`:
+
+```bash
+python scripts/aggregate_seqval_hparams.py \
+    --train_root_dir <train_root_dir> \
+    --eval_root_dir  <eval_root_dir> \
+    --cache_dir      <cache_dir> \
+    --train_tag  "Rollout/Success_Rate/<TaskName>-mean" \
+    --train_tag_is_rate true \
+    --seqval_tag "SequentialValid/PrefixSurvival_Score" \
+    --k_list 1 2 3 5 \
+    --out_json out/corr.json --out_csv out/corr.csv
+```
+
+- `--train_tag_is_rate true` treats `A` as a rate and skips checkpoints whose
+  value falls outside `[0, 1]`.
+- Mixing a higher-is-better proxy (PrefixSurvival_Score) with lower-is-better
+  ones (Loss / MSE / OMN) in one run? Negate the latter with
+  `--negate_tag "Valid/Loss" "SequentialValid/ActionL2_mean"` so all proxies are
+  oriented "higher = better" before correlating.
+
+### What the metrics mean (`A` = success rate, `B` = proxy)
+
+| Metric | Meaning | Better |
+|---|---|---|
+| `spearman` | rank correlation of `A` vs `B` over checkpoints | higher |
+| `delta_spearman` | same on first differences (step-to-step trend) | higher |
+| `kendall_tau` | rank concordance (toggle `--disable_kendall`) | higher |
+| `hit@k` | does the top-`k` of `B` include the best-`A` checkpoint? | higher |
+| `nregret` | success-rate gap between true-best and `B`-selected ckpt | lower |
+| `rank_pct` | percentile rank of the true-best ckpt under `B` | lower |
+| `mmrv` | Mean Maximum Rank Violation (Li et al. 2024, arXiv:2405.05941) | lower |
+
+`hit@k` and `nregret` answer the practical question: *"if I pick the checkpoint
+my proxy likes best, how close to the truly-best success rate do I land?"*
+
+### Optional: posterior over success (small rollout budget)
+
+If each success rate came from only a few hundred rollouts, the point estimate is
+noisy. Pass `--use_posterior_success` with `--train_success_count_tag` (success
+counts `k`) and `--n_rollouts n`; surval samples `A ~ Beta(k+a, n-k+b)` and
+returns the MC expectation of every metric, so the CI reflects rollout noise too.
+
+---
+
+## 10. Legacy proxy metrics (validation loss, off-manifold norm, action MSE)
+
+These predate the PrefixSurvival metric and are kept for **baseline comparison
+only**. They are not needed for the lean path (§5–7); document them here so they
+don't clutter the core schema.
+
+### Where they live in the cache
+
+```
+metrics/
+└── valid/
+    ├── Loss                          float64  ()   validation loss (NaN if unset)
+    ├── off_manifold_norm/                          ← nested form the reader reads
+    │   └── sample_<k>                float64  ()
+    └── Off_Manifold_Norm   (flat)    float64  ()   ← LEGACY robomimic form
+```
+
+Write them via the optional `write_seqcache_hdf5(..., val_loss=, off_manifold_norms=)`
+arguments. `off_manifold_norms` accepts `{sample_idx: value}`, a bare scalar
+(treated as `{0: value}`), or `None`.
+
+> **⚠️ Off-manifold-norm format gotcha (observed in current robomimic caches).**
+> The main reader reads OMN **only** from the nested group
+> `metrics/valid/off_manifold_norm/sample_<k>`. Current robomimic caches instead
+> store a **flat** scalar `metrics/valid/Off_Manifold_Norm` (capital, no
+> sub-group), which the main reader **silently drops** (`valid_off = None`). The
+> `tb_aggregate` seqcache path (`extract_seqcache_metrics.py`) reads the flat
+> scalar directly, so cross-seed OMN aggregation still works; only the main
+> reader is affected. Regenerate caches in nested form to use OMN through the
+> main reader.
+
+### Computing them across seeds
+
+The action-MSE variants and the `Cache/Valid/*` series come from the HDF5
+directly, not from TB:
+
+```bash
+python scripts/extract_seqcache_metrics.py --seqcache_root <root> --cache_dir <cache_dir>
+```
+
+This writes `<cache_dir>/seqcache_metrics/<seed>/<group>.json` with
+`Cache/Valid/Loss`, `Cache/Valid/Off_Manifold_Norm`, and five MSE variants
+(`MSE_t0_only`, `MSE_tlast`, ...; see `surval.tb_aggregate.seqcache_metrics`).
+Then point `aggregate_seqval_hparams.py` at them with
+`--force_seqcache_for_tag` / `--seqval_tag "Cache/Valid/Loss" ...`. The
+per-task baseline driver `run_baselines_per_task.py` →
+`summarize_baselines.py` wraps this end-to-end.
+
+---
+
+## 11. Module map
+
+| Module | Purpose |
+|---|---|
+| `surval.cache_io` | Canonical HDF5 cache **writer** + helpers shared by every producer |
+| `surval.sequential_validate` | Reads caches; computes PrefixSurvival / per-block scaled-error metrics |
+| `surval.local_threshold` | State-conditional threshold maps (`local`, `global_db`, `intra_demo_sc`) — uses `obs_features` |
+| `surval.scale_estimation`, `surval.surval`, `surval.gates` | Regime-conditioned scale lookup + gate functions |
+| `surval.tb_aggregate` | TB / seqcache scalar caching + cross-seed proxy metrics (used by `scripts/`) |
+| `scripts/` | Extract → aggregate → summarize/report pipeline (baselines, our method, ablations) |
+
+---
+
+## 12. Where to go next
+
+- **Full cache schema, public `cache_io` API, producer/reader examples,
+  migration notes:** [`docs/REFERENCE.md`](docs/REFERENCE.md)
+- **Building / querying state-conditional thresholds:**
+  [`src/surval/local_threshold/README.md`](src/surval/local_threshold/README.md)
+- **Ablation knobs** (`--scale-groups-mode`, `--prefix-time-reduction`):
+  `add_common_args` in `src/surval/sequential_validate.py`,
+  `tests/ablation_test.py`
 
 ---
 
@@ -281,7 +473,3 @@ cd /home/changyeon/workspace/surval
 pip install -e .[full,dev]
 pytest tests/ -v
 ```
-
-`tests/cache_io_test.py` covers the writer ↔ reader round-trip and every
-helper. The off-manifold tests are skipped when `scikit-learn` is not
-installed; install the `omn` extra (or the `full` extra) to run them.
