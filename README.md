@@ -187,13 +187,58 @@ first timestep). Every current cache writes it (`has_obs_features = 1`).
 
 ## 6. Producing a cache
 
-In your training repo, after one validation pass:
+There are two ways to write a cache.
+
+### 6a. Generic builder (recommended) — `surval.ingest`
+
+Use this when your ground truth lives in a standard dataset format. surval reads
+the dataset, slices ground-truth action chunks, and writes the cache; you only
+supply your policy's prediction (and, optionally, feature) callbacks — the one
+part that can't be generic.
+
+```python
+from surval.ingest import RobomimicHDF5Reader, build_seqcache
+
+reader = RobomimicHDF5Reader(
+    "demos.hdf5", split="valid",
+    obs_keys=["robot0_left_eef_pos", "robot0_right_eef_pos"],   # fed to your callbacks
+    state_keys=["robot0_left_eef_pos", "robot0_right_eef_pos"], # obs_features fallback
+)
+
+def predict_fn(obs_batch):          # {obs_key: [B, ...]} at each row's start frame
+    return my_policy(obs_batch)     # -> [S, B, T_h, A]  (or [B, T_h, A] => S=1)
+
+build_seqcache(
+    "out/seqcache_step_000600.hdf5", reader,
+    predict_fn=predict_fn,
+    feature_fn=my_encoder,          # obs_batch -> [B, F]; omit to use dataset state
+    horizon=15, num_samples=8, step=600, checkpoint="/path/to/ckpt",
+)
+```
+
+**Supported dataset formats:**
+
+| Reader | Format | Dependency |
+|---|---|---|
+| `RobomimicHDF5Reader` | robomimic / robocasa / dexmimicgen HDF5 (`data/demo_*/{actions,obs}`, `mask/` splits) | `h5py` (core) |
+| `LeRobotReader` | LeRobot v2.x parquet (`meta/info.json` + per-episode parquet) | `pyarrow` — `pip install surval[lerobot]` |
+
+`LeRobotReader` reads parquet directly (no `lerobot` package needed) and loads
+numeric columns only; image/video observations are skipped. Any other library?
+Subclass `surval.ingest.EpisodeReader` (yield `Episode(demo_id, actions, obs,
+state)`) and reuse the same `build_seqcache`. `obs_features` is filled by
+`feature_fn`, falling back to the episode `state`; if neither exists, the build
+errors (the field is required, §5).
+
+### 6b. Low-level writer — `surval.cache_io.write_seqcache_hdf5`
+
+Use this when you already have the row arrays in memory (e.g. an existing
+training loop) and just need to serialize them:
 
 ```python
 import numpy as np
 from surval.cache_io import write_seqcache_hdf5
 
-# `step` (openpi) or `epoch` (robomimic) — must match filename + --cache-mode (§4)
 write_seqcache_hdf5(
     f"/path/to/cache/seqcache_step_{step:06d}.hdf5",   # ..._epoch_... for robomimic
     demo_ids=np.array(demo_ids_all),           # [N] str, one per row
@@ -206,8 +251,8 @@ write_seqcache_hdf5(
 )
 ```
 
-`write_seqcache_hdf5` regroups the flat `[N, ...]` arrays into `data/demo_<i>/`
-by `demo_ids` and writes the canonical schema. A complete producer loop is in
+It regroups the flat `[N, ...]` arrays into `data/demo_<i>/` by `demo_ids` and
+writes the canonical schema. A complete producer loop is in
 [`docs/REFERENCE.md`](docs/REFERENCE.md#producer-side-example).
 
 > Older callers also passed `val_loss=` / `off_manifold_norms=`; those feed the
@@ -445,6 +490,7 @@ per-task baseline driver `run_baselines_per_task.py` →
 
 | Module | Purpose |
 |---|---|
+| `surval.ingest` | Generic cache builder + dataset readers (robomimic/robocasa HDF5, LeRobot) |
 | `surval.cache_io` | Canonical HDF5 cache **writer** + helpers shared by every producer |
 | `surval.sequential_validate` | Reads caches; computes PrefixSurvival / per-block scaled-error metrics |
 | `surval.local_threshold` | State-conditional threshold maps (`local`, `global_db`, `intra_demo_sc`) — uses `obs_features` |
