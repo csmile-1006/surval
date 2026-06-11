@@ -947,6 +947,7 @@ def _compute_from_cache(
     block_prefix_vote_n=None,
     prefix_soft_aggregator="worst_n",
     prefix_soft_lse_tau=1.0,
+    prefix_time_reduction="product",
     valid_loss=None,
     valid_off=None,
 ):
@@ -1040,6 +1041,21 @@ def _compute_from_cache(
         threshold_quantile=threshold_quantile,
         action_space_block_types=block_types,
     )
+
+    # Group-pool per-row per-block scales for state-conditional / global-DB
+    # methods. inter_demo / intra_demo already pool inside their estimators
+    # (or stay per-block when --block-no-share-scales-across-arms); this is
+    # the local-side equivalent. When run() flattened scale_groups to one
+    # block per group (--scale-groups-mode=flat), every group has |blocks|=1
+    # and this loop is a no-op — that's how the flat/grouped ablation
+    # actually toggles for local.
+    if _scale_method in ("local", "global_db", "intra_demo_sc"):
+        block_idx = {k: i for i, k in enumerate(block_names)}
+        for group in scale_groups:
+            idxs = [block_idx[b] for b in group["blocks"] if b in block_idx]
+            if len(idxs) > 1:
+                pooled = scales_per_row[:, idxs].mean(axis=1, keepdims=True)
+                scales_per_row[:, idxs] = pooled
 
     num_blocks = len(block_names)
     # Default N: strict majority of blocks (e.g. 3 of 4, 2 of 3).
@@ -1180,7 +1196,10 @@ def _compute_from_cache(
                     e_t[t] = float(-log_mean_exp / lse_tau)
                 else:  # soft_agg == "product"
                     e_t[t] = float(np.prod(p_b))
-            s = np.cumprod(e_t)
+            if str(prefix_time_reduction).lower() == "mean":
+                s = np.cumsum(e_t) / np.arange(1, t_len + 1, dtype=np.float64)
+            else:
+                s = np.cumprod(e_t)
             if str(prefix_scoring_mode) == "weighted_sum":
                 w = 1.0 - np.arange(t_len, dtype=np.float64) / max(t_len, 1)
                 score_d = float(np.dot(w, s))
@@ -1213,7 +1232,10 @@ def _compute_from_cache(
                 num_violate = int(num_blocks - np.sum(e_b))
                 if num_violate >= n:
                     e_t[t] = 0.0
-            s = np.cumprod(e_t)
+            if str(prefix_time_reduction).lower() == "mean":
+                s = np.cumsum(e_t) / np.arange(1, t_len + 1, dtype=np.float64)
+            else:
+                s = np.cumprod(e_t)
             score_d = float(np.mean(s))
             all_tau_chunk.append(0.0)
             num_ok_per_t = np.sum(err_mat < eps_hard, axis=0)
@@ -1501,6 +1523,7 @@ def _run_single_cache_group(group, args, action_space_config):
             block_prefix_vote_n=args.block_prefix_vote_n,
             prefix_soft_aggregator=args.prefix_soft_aggregator,
             prefix_soft_lse_tau=args.prefix_soft_lse_tau,
+            prefix_time_reduction=getattr(args, "prefix_time_reduction", "product"),
             valid_loss=valid_loss,
             valid_off=valid_off,
         )
@@ -1563,7 +1586,31 @@ def _cache_group_worker(payload):
     return _run_single_cache_group(group, args, action_space_config)
 
 
+def _flatten_scale_groups(action_space_config):
+    """Return a shallow copy of action_space_config with one-block-per-group scale_groups.
+
+    Each block in block_names becomes its own group with summary_key=block_name.
+    The input dict is not mutated. summary_scale_fields is left as-is, which
+    means consumer-supplied summary scalars keyed by pooled group names won't be
+    populated under the flat regime — that's intentional for ablation runs
+    (the PrefixSurvival_Score metric is unaffected).
+    """
+    new_cfg = dict(action_space_config)
+    new_cfg["scale_groups"] = [
+        {"blocks": [b], "summary_key": b} for b in new_cfg["block_names"]
+    ]
+    return new_cfg
+
+
 def run(args, action_space_config):
+    scale_groups_mode = str(getattr(args, "scale_groups_mode", "grouped")).lower()
+    if scale_groups_mode == "flat":
+        action_space_config = _flatten_scale_groups(action_space_config)
+    elif scale_groups_mode != "grouped":
+        raise ValueError(
+            f"--scale-groups-mode must be 'grouped' or 'flat'; got {scale_groups_mode!r}"
+        )
+
     cache_mode = str(getattr(args, "cache_mode", "step"))
     cache_groups = _discover_cache_groups(args.cache_dir, mode=cache_mode)
     if not cache_groups:
@@ -1820,6 +1867,34 @@ def add_common_args(parser):
             "Temperature τ (>0) for --prefix-soft-aggregator=logsumexp. "
             "Larger τ ⇒ closer to min (worst block); smaller τ ⇒ closer to mean. "
             "Continuous analog of the integer K in worst_n."
+        ),
+    )
+    parser.add_argument(
+        "--scale-groups-mode",
+        type=str,
+        default="grouped",
+        choices=["grouped", "flat"],
+        help=(
+            "How to use the action_space_config's scale_groups. "
+            "'grouped' (default): use the consumer-supplied scale_groups as-is "
+            "(blocks may be pooled for shared scale estimation). "
+            "'flat': override scale_groups to one block per group "
+            "(no pooling). Ablation variant that removes the grouping stage."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-time-reduction",
+        type=str,
+        default="product",
+        choices=["product", "mean"],
+        help=(
+            "How to reduce per-timestep survival values e_t into the prefix-survival "
+            "vector s used by --prefix-scoring-mode. "
+            "'product' (default): s = cumprod(e_t) — first-failure cliff (current "
+            "SURVAL behavior). "
+            "'mean': s = cumsum(e_t) / (1..T) — cumulative mean, no cliff. Ablation "
+            "variant that replaces the multiplicative time aggregator with an additive "
+            "one. Applies to both --prefix-mode=soft and --prefix-mode=hard."
         ),
     )
     parser.add_argument(
