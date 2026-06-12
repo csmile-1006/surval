@@ -1,28 +1,70 @@
 # surval
 
 Open-source implementation of **SurVAL: Rollout-Free Survival Validation for
-Robot Policies** ([citation below](#citation)).
+Robot Policies** ([citation](#citation)).
 
-Rank training checkpoints by how well a policy's predicted actions survive
-against the ground-truth trajectory — the **SurVAL** metric — computed
-from a cached HDF5 of rollouts, with no simulator in the loop. surval is a
-library: you produce a cache, surval scores it, and you correlate the score
-against real success rate.
+Reliably ranking robot-policy checkpoints needs closed-loop rollouts, but a
+single training run yields dozens of checkpoints and you can only afford to roll
+out a few. Rollout-free proxies like average prediction error mislead: averaging
+dilutes one catastrophic deviation among many nominal steps — even though a
+single such deviation is enough to make a real rollout fail. **SurVAL** scores a
+checkpoint by how well its predictions *survive* along held-out demonstrations:
+at each step it compares the per-group prediction error against a threshold
+derived automatically from the demos, turns it into a survival probability, and
+aggregates these **multiplicatively** along the trajectory — so one severe
+deviation collapses the score while small errors leave it nearly intact. No
+simulator, no world model, no rollouts. SurVAL tracks real deployment success
+rate (in sim and on real robots, for a diffusion policy and a 3B VLA) where
+averaging baselines degrade or invert the ranking.
 
-```
-produce cache  ──►  score (SurVAL / checkpoint)  ──►  correlate vs. success rate
-```
-
-## Install
+## Quickstart
 
 ```bash
-pip install -e .[full,dev]      # dev: pytest; full: faiss + matplotlib + sklearn + pyarrow
+pip install -e .[full,dev]
 ```
 
-Extras: `db` (faiss — state DB), `lerobot` (pyarrow — LeRobot reader), `sanity`
-(matplotlib), `omn` (scikit-learn — legacy off-manifold norm), `full`, `dev`.
-Downstream projects pin by commit SHA, e.g.
-`surval = { git = "https://github.com/csmile-1006/surval.git", rev = "<sha>" }`.
+1. **Produce a cache** — at each checkpoint, dump the policy's predicted actions
+   next to the ground-truth actions into one HDF5 (`surval.ingest.build_seqcache`
+   for a standard dataset, or `surval.cache_io.write_seqcache_hdf5` if your model
+   brings its own loader).
+2. **Score it** → a SurVAL value per checkpoint (+ a tiny proxy `.npz`):
+   ```bash
+   python scripts/score_seqcache.py --cache-dir <caches> --output-dir <out> --action-space droid
+   ```
+3. **(optional) Validate** SurVAL against real success rate on your setup:
+   ```bash
+   python scripts/extract_tb_metrics.py --tb-dir <train_tb> --out gt.npz --success-tag Success_Rate
+   python scripts/correlate_metrics.py --gt gt.npz --proxy <out>/proxy_metrics.npz
+   ```
+
+`--action-space` is a built-in robot layout (`droid` / `gripper` / `dex` /
+`humanoid` / `gr1`). Everything is surval-only — TensorBoard is read only for the
+ground-truth `success_rate` / `valid_loss` in step 3.
+
+## Using your own data, model, or robot
+
+surval is policy/dataset/robot-agnostic — you wire up at most three things, and
+the scoring above is unchanged:
+
+- **Dataset** — where ground-truth actions come from: subclass
+  `surval.ingest.EpisodeReader`, or use the low-level writer if your model's
+  loader already pre-chunks rows.
+- **Model** — `predict_fn` (predicted action chunks) + `feature_fn` (the model's
+  **own** per-row feature, stored as the required `obs_features`).
+- **Action space** — a block layout added to `surval.action_spaces`.
+
+Step-by-step how-to with snippets: [`docs/EXTENDING.md`](docs/EXTENDING.md).
+Runnable end-to-end examples (all open-source, GPU):
+
+| Example | Model | Data |
+|---|---|---|
+| [`build_seqcache_robomimic.py`](examples/build_seqcache_robomimic.py) | robomimic `flow_policy` | dexmimicgen HDF5 |
+| [`build_seqcache_rlds_openpi.py`](examples/build_seqcache_rlds_openpi.py) | openpi pi0 / pi05 | RLDS DROID |
+| [`build_seqcache_gr00t.py`](examples/build_seqcache_gr00t.py) | NVIDIA GR00T N1.5 | Isaac-GR00T `demo_data` |
+
+---
+
+The rest of this page is reference detail.
 
 ## Cache schema
 
@@ -55,13 +97,12 @@ hard-code them.
 
 **`surval.ingest`** — give a dataset reader + your policy callbacks; surval slices
 the ground-truth action chunks and writes the cache (the model-specific
-`predict_fn`/`feature_fn` is the only part that can't be generic):
+`predict_fn` / `feature_fn` is the only part that can't be generic):
 
 ```python
 from surval.ingest import RobomimicHDF5Reader, build_seqcache
 
-reader = RobomimicHDF5Reader("demos.hdf5", split="valid",
-                             obs_keys=[...], state_keys=[...])
+reader = RobomimicHDF5Reader("demos.hdf5", split="valid", obs_keys=[...], state_keys=[...])
 build_seqcache(
     "out/seqcache_step_000600.hdf5", reader,
     predict_fn=my_policy,    # {obs_key: [B, ...]} -> [S, B, T, A]
@@ -72,38 +113,36 @@ build_seqcache(
 
 Readers: `RobomimicHDF5Reader` (robomimic/robocasa/dexmimicgen HDF5),
 `LeRobotReader` (LeRobot v2.x parquet, `pip install .[lerobot]`); subclass
-`EpisodeReader` for anything else. Runnable example:
-[`examples/build_seqcache_robomimic.py`](examples/build_seqcache_robomimic.py).
+`EpisodeReader` for anything else.
 
 **`surval.cache_io.write_seqcache_hdf5(...)`** — low-level, when you already have
-the row arrays in memory (e.g. a model with its own video-aware data pipeline).
-Examples: [`examples/build_seqcache_rlds_openpi.py`](examples/build_seqcache_rlds_openpi.py)
-(openpi pi0/pi05 on RLDS DROID) and
-[`examples/build_seqcache_gr00t.py`](examples/build_seqcache_gr00t.py) (NVIDIA
-Isaac-GR00T N1.5 on its public `demo_data`, scored with `--action-space gr1`) —
-both fully open-source, runnable on a GPU.
+the row arrays in memory (e.g. a model with its own video-aware data pipeline
+that pre-chunks rows, like the openpi/RLDS and GR00T examples).
 
-## Scoring + the metric (3 scripts, surval-only)
+## The SurVAL metric & `--block-scale-method`
 
-The proxy `B` (SurVAL) comes from surval scoring the cache; the **only**
-things read from TensorBoard are `success_rate` (ground truth `A`) and
-`valid_loss`.
+`score_seqcache.py` writes the per-checkpoint `SurVAL_Score`. Per timestep, the
+per-block prediction error is compared against a tolerance `S_g`, turned into a
+survival probability, aggregated across blocks by a soft LogSumExp smooth-min
+(`--soft-lse-tau`) and over time by a cumulative product (`--time-reduction`,
+ablation). `S_g` is picked by `--block-scale-method`, as
+`{inter, intra} × {state-free, state-conditional}`:
 
-```bash
-# 1. score a cache dir -> per-step proxy npz (SurVAL, valid_loss, action_l2)
-python scripts/score_seqcache.py --cache-dir <caches> --output-dir <out> \
-    --action-space droid --block-scale-method inter
+- **`inter`** (default, state-free): cross-demo expert disagreement at similar progress.
+- **`intra`** (state-free): within-demo expert chunk motion `||a[t+ta] - a[t]||`.
+- **`state_inter` / `state_intra`** (state-conditional): the per-state version,
+  from a state DB keyed on `obs_features`. Build it with
+  `scripts/build_state_db_from_cache.py` → `scripts/compute_local_thresholds.py`,
+  then score with `--block-scale-method state_inter --state-db-dir <db>
+  --threshold-quantile 0.9`. See
+  [`src/surval/local_threshold/README.md`](src/surval/local_threshold/README.md).
 
-# 2. pull success_rate + valid_loss from the training TB -> gt.npz
-python scripts/extract_tb_metrics.py --tb-dir <train_tb> --out gt.npz \
-    --success-tag Success_Rate --valid-loss-tag Valid/Loss
+## Validating against success rate
 
-# 3. correlate proxy (B) vs success_rate (A)   (multiple seeds: pass paired lists)
-python scripts/correlate_metrics.py --gt gt.npz --proxy <out>/proxy_metrics.npz
-```
-
-`--action-space` is a built-in layout (`droid` / `gripper` / `dex` / `humanoid`).
-`correlate_metrics` aligns by step and reports, for `A` = success rate, `B` = proxy:
+To check SurVAL ranks checkpoints like real success rate, `extract_tb_metrics`
+pulls the ground-truth `success_rate` (and `valid_loss`) from the training TB,
+and `correlate_metrics` aligns it with the proxy by step (multiple seeds:
+paired lists → bootstrap CI). For `A` = success rate, `B` = proxy:
 
 | Metric | Meaning | Better |
 |---|---|---|
@@ -111,29 +150,6 @@ python scripts/correlate_metrics.py --gt gt.npz --proxy <out>/proxy_metrics.npz
 | `hit@k` | top-`k` of `B` includes the best-`A` checkpoint? | higher |
 | `nregret` | success-rate gap between true-best and `B`-selected checkpoint | lower |
 | `mmrv` | Mean Maximum Rank Violation (Li et al. 2024, arXiv:2405.05941) | lower |
-
-### `--block-scale-method` — `{inter, intra} × {state-free, state-conditional}`
-
-The per-block tolerance `S_g` the errors are compared against:
-
-- **`inter`** (default, state-free): cross-demo expert disagreement at similar progress.
-- **`intra`** (state-free): within-demo expert chunk motion `||a[t+ta] - a[t]||`.
-- **`state_inter` / `state_intra`** (state-conditional): the per-state version,
-  looked up from a state DB keyed on `obs_features`. Build it with
-  `scripts/build_state_db_from_cache.py` → `scripts/compute_local_thresholds.py`,
-  then score with `--block-scale-method state_inter --state-db-dir <db>
-  --threshold-quantile 0.9`. See
-  [`src/surval/local_threshold/README.md`](src/surval/local_threshold/README.md).
-
-Per-step survival probabilities are aggregated across blocks by a soft LogSumExp
-smooth-min (`--soft-lse-tau`) and over time by a cumulative product; ablation
-knobs `--scale-groups-mode {grouped,flat}` and `--time-reduction {product,mean}`
-(`tests/ablation_test.py`).
-
-## Extending
-
-Adding a new **dataset**, **model**, or **action space** →
-[`docs/EXTENDING.md`](docs/EXTENDING.md).
 
 ## Module map
 
