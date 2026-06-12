@@ -15,8 +15,12 @@ glue stays here in the example, because only your policy knows it:
   2. **Observation history** — the policy consumes `observation_horizon` stacked
      frames. We expand each per-step obs into a `[T_ep, To, ...]` stack in a
      reader wrapper so `build_seqcache` hands `predict_fn` a `[B, To, ...]` batch.
-  3. **predict_fn / feature_fn** — thin wrappers over `model.get_action` (sampled
-     `num_samples` times) and `model.get_state_features` (the obs_features).
+  3. **predict_fn / feature_fn** — `predict_fn` wraps `model.get_action` (sampled
+     `num_samples` times). `feature_fn` captures the policy's *own* encoded
+     observation (visual + low-dim, `[B, D]`) as `obs_features` by registering a
+     forward hook on its `ObservationGroupEncoder` — the standard robomimic
+     observation encoder (`self.nets["encoder"]` in MIMO_MLP / RNN_MIMO_MLP).
+     No custom model method required; works with any vanilla robomimic policy.
 
 Requires the robomimic fork that defines `flow_policy` on the PYTHONPATH (this is
 NOT a surval dependency). Run inside that environment, e.g.:
@@ -40,6 +44,7 @@ import os
 import numpy as np
 import torch
 
+import robomimic.models.obs_nets as ObsNets
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.torch_utils as TorchUtils
@@ -103,13 +108,54 @@ class FrameStackedReader:
                           obs=stacked, state=None)
 
 
-def make_callbacks(model, device, num_samples):
-    """predict_fn (sampled action chunks) + feature_fn (obs_features), both over
-    the To-frame obs batch produced by FrameStackedReader."""
+def attach_obs_encoder_hook(model):
+    """Register a forward hook on the policy's observation encoder.
+
+    Every robomimic policy encodes its observations through an
+    `ObservationGroupEncoder` (e.g. `self.nets["policy"]["obs_encoder"]`). Its
+    forward output is the concatenated per-modality feature vector — exactly the
+    model's own state feature. We grab it with a hook so no policy-specific
+    method is needed.
+
+    `get_action` runs the EMA copy of the weights when the policy keeps an EMA
+    (`model.ema.averaged_model`), so we hook the encoder inside *that* module —
+    the one inference actually evaluates — falling back to `model.nets`.
+
+    Returns `(captured, handle)` where `captured["v"]` holds the latest output
+    tensor after each forward, and `handle.remove()` detaches the hook.
+    """
+    ema = getattr(model, "ema", None)
+    root = ema.averaged_model if ema is not None else model.nets
+    encoder = next((m for m in root.modules()
+                    if isinstance(m, ObsNets.ObservationGroupEncoder)), None)
+    if encoder is None:
+        raise RuntimeError("no ObservationGroupEncoder found in the inference net; "
+                           "cannot derive obs_features via a hook for this policy.")
+    captured = {}
+
+    def _hook(_module, _inp, out):
+        captured["v"] = out.detach()
+
+    return captured, encoder.register_forward_hook(_hook)
+
+
+def make_callbacks(model, device, num_samples, captured):
+    """predict_fn (sampled action chunks) + feature_fn (encoder obs_features), both
+    over the To-frame obs batch produced by FrameStackedReader."""
 
     def to_obs_dict(obs_batch):
         proc = ObsUtils.process_obs_dict({k: np.asarray(v) for k, v in obs_batch.items()})
         return {k: torch.as_tensor(v).float().to(device) for k, v in proc.items()}
+
+    def _pool_to_batch(out, batch):
+        # The encoder may be called as [B, D], [B, T, D], or frame-stacked
+        # [B*To, D]; collapse any extra leading/time axes by mean-pooling -> [B, F].
+        o = out
+        if o.ndim == 3:
+            o = o.reshape(o.shape[0], -1, o.shape[-1]).mean(1)  # [*, D]
+        if o.shape[0] != batch:
+            o = o.reshape(batch, -1, o.shape[-1]).mean(1)       # [B, D]
+        return o.float().cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
     def predict_fn(obs_batch):
@@ -122,7 +168,10 @@ def make_callbacks(model, device, num_samples):
 
     @torch.no_grad()
     def feature_fn(obs_batch):
-        return model.get_state_features(to_obs_dict(obs_batch), None).cpu().numpy().astype(np.float32)
+        batch = len(next(iter(obs_batch.values())))
+        captured.clear()
+        model.get_action(obs_dict=to_obs_dict(obs_batch), goal_dict=None)  # fires the hook
+        return _pool_to_batch(captured["v"], batch)
 
     return predict_fn, feature_fn
 
@@ -157,13 +206,17 @@ def main():
     normalize = build_action_normalizer(ckpt, action_keys, sm["ac_dim"])
     base = RobomimicHDF5Reader(args.dataset, split=args.split, obs_keys=obs_keys)
     reader = FrameStackedReader(base, normalize, To, args.max_demos)
-    predict_fn, feature_fn = make_callbacks(model, device, args.num_samples)
+    captured, handle = attach_obs_encoder_hook(model)
+    predict_fn, feature_fn = make_callbacks(model, device, args.num_samples, captured)
 
-    summary = build_seqcache(
-        args.out, reader, predict_fn=predict_fn, feature_fn=feature_fn,
-        horizon=horizon, num_samples=args.num_samples, step=args.step,
-        checkpoint=args.ckpt, pad_mode="drop", batch_size=args.batch_size, max_rows=args.max_rows,
-    )
+    try:
+        summary = build_seqcache(
+            args.out, reader, predict_fn=predict_fn, feature_fn=feature_fn,
+            horizon=horizon, num_samples=args.num_samples, step=args.step,
+            checkpoint=args.ckpt, pad_mode="drop", batch_size=args.batch_size, max_rows=args.max_rows,
+        )
+    finally:
+        handle.remove()
     print(f"[build] {summary}")
 
     # sanity: the cache round-trips through the surval reader
