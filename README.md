@@ -73,8 +73,12 @@ Readers: `RobomimicHDF5Reader` (robomimic/robocasa/dexmimicgen HDF5),
 [`examples/build_seqcache_robomimic.py`](examples/build_seqcache_robomimic.py).
 
 **`surval.cache_io.write_seqcache_hdf5(...)`** — low-level, when you already have
-the row arrays in memory (e.g. openpi's RLDS loader pre-chunks rows). Example:
-[`examples/build_seqcache_rlds_openpi.py`](examples/build_seqcache_rlds_openpi.py).
+the row arrays in memory (e.g. a model with its own video-aware data pipeline).
+Examples: [`examples/build_seqcache_rlds_openpi.py`](examples/build_seqcache_rlds_openpi.py)
+(openpi pi0/pi05 on RLDS DROID) and
+[`examples/build_seqcache_gr00t.py`](examples/build_seqcache_gr00t.py) (NVIDIA
+Isaac-GR00T N1.5 on its public `demo_data`, scored with `--action-space gr1`) —
+both fully open-source, runnable on a GPU.
 
 ## Scoring + the metric (3 scripts, surval-only)
 
@@ -129,7 +133,7 @@ ablation knobs `--scale-groups-mode {grouped,flat}` and `--prefix-time-reduction
 | `surval.ingest` | Generic cache builder + dataset readers (robomimic/robocasa HDF5, LeRobot) |
 | `surval.cache_io` | Canonical HDF5 cache writer + helpers |
 | `surval.sequential_validate` | Reads caches; computes PrefixSurvival / per-block scaled-error metrics |
-| `surval.action_spaces` | Built-in block layouts (droid/gripper/dex/humanoid) |
+| `surval.action_spaces` | Built-in block layouts (droid/gripper/dex/humanoid/gr1) |
 | `surval.local_threshold` | State-conditional threshold maps (`state_inter`, `state_intra`) |
 | `surval.tb_aggregate` | TB scalar I/O + cross-seed proxy metrics |
 | `scripts/` | `score_seqcache` → `extract_tb_metrics` → `correlate_metrics`; state DB: `build_state_db_from_cache` → `compute_local_thresholds` |

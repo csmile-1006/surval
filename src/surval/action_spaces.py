@@ -83,7 +83,24 @@ HUMANOID = {
     "block_types": {"R_rot": "rot6d", "L_rot": "rot6d"},
 }
 
-ACTION_SPACES = {"droid": DROID, "gripper": GRIPPER, "dex": DEX, "humanoid": HUMANOID}
+# GR1 humanoid arms+hands (NVIDIA Isaac-GR00T fourier_gr1_arms_only): 26-D
+# [left_arm(7), right_arm(7), left_hand(6), right_hand(6)].
+GR1 = {
+    "action_dim": 26,
+    "block_names": ["left_arm", "right_arm", "left_hand", "right_hand"],
+    "block_slices": {"left_arm": slice(0, 7), "right_arm": slice(7, 14),
+                     "left_hand": slice(14, 20), "right_hand": slice(20, 26)},
+    "block_dims": {"left_arm": 7, "right_arm": 7, "left_hand": 6, "right_hand": 6},
+    "arm_pairs": [("left_arm", "right_arm"), ("left_hand", "right_hand")],
+    "scale_groups": [
+        {"blocks": ["left_arm", "right_arm"], "summary_key": "s_arm"},
+        {"blocks": ["left_hand", "right_hand"], "summary_key": "s_hand"},
+    ],
+    "summary_scale_fields": [("ActionBlockScale_arm", "s_arm"), ("ActionBlockScale_hand", "s_hand")],
+    "block_types": {},
+}
+
+ACTION_SPACES = {"droid": DROID, "gripper": GRIPPER, "dex": DEX, "humanoid": HUMANOID, "gr1": GR1}
 
 
 def get_action_space(name: str) -> dict:
