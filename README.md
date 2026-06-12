@@ -3,20 +3,6 @@
 Open-source implementation of **SurVAL: Rollout-Free Survival Validation for
 Robot Policies** ([citation](#citation)).
 
-Reliably ranking robot-policy checkpoints needs closed-loop rollouts, but a
-single training run yields dozens of checkpoints and you can only afford to roll
-out a few. Rollout-free proxies like average prediction error mislead: averaging
-dilutes one catastrophic deviation among many nominal steps — even though a
-single such deviation is enough to make a real rollout fail. **SurVAL** scores a
-checkpoint by how well its predictions *survive* along held-out demonstrations:
-at each step it compares the per-group prediction error against a threshold
-derived automatically from the demos, turns it into a survival probability, and
-aggregates these **multiplicatively** along the trajectory — so one severe
-deviation collapses the score while small errors leave it nearly intact. No
-simulator, no world model, no rollouts. SurVAL tracks real deployment success
-rate (in sim and on real robots, for a diffusion policy and a 3B VLA) where
-averaging baselines degrade or invert the ranking.
-
 ## Quickstart
 
 ```bash
