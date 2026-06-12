@@ -126,6 +126,50 @@ Prefix survival is soft (LogSumExp smooth-min over blocks, `--prefix-soft-lse-ta
 ablation knobs `--scale-groups-mode {grouped,flat}` and `--prefix-time-reduction
 {product,mean}` (`tests/ablation_test.py`).
 
+## Extending: a new dataset, model, or action space
+
+**New dataset** — two paths:
+
+- *Per-episode dataset* (you can iterate raw trajectories): subclass
+  `surval.ingest.EpisodeReader` and yield
+  `Episode(demo_id, actions=[T_ep, A], obs={key: [T_ep, ...]}, state=[T_ep, D] | None)`.
+  `build_seqcache` then slices the horizon chunks for you. Models for the existing
+  readers: `RobomimicHDF5Reader`, `LeRobotReader`.
+- *Model with its own (e.g. video) data pipeline that pre-chunks rows*: skip the
+  reader — collect the row arrays and call `cache_io.write_seqcache_hdf5(...)`
+  directly (see the openpi/RLDS and GR00T examples).
+
+**New model** — supply two callbacks (or, on the low-level path, produce their
+outputs yourself):
+
+- `predict_fn(obs_batch) -> [S, B, T, A]` — your policy's predicted action chunks
+  (`obs_batch` is `{obs_key: [B, ...]}` at each row's start frame; `S` samples).
+- `feature_fn(obs_batch) -> [B, F]` — the model's **own** per-row feature output,
+  written as the required `obs_features` (a VLM/backbone embedding, an encoder
+  output, ...). It keys the state-conditional thresholds; omit it only if the
+  reader supplies `Episode.state`. The GR00T example shows capturing it with a
+  forward hook on the backbone.
+
+**New action space** — add a layout to `surval.action_spaces.ACTION_SPACES`
+(then `score_seqcache.py --action-space <name>` works):
+
+```python
+MY_ROBOT = {
+    "action_dim": A,
+    "block_names": ["pos", "rot", "grip"],                 # semantic blocks
+    "block_slices": {"pos": slice(0, 3), "rot": slice(3, 9), "grip": slice(9, 10)},
+    "block_dims": {"pos": 3, "rot": 6, "grip": 1},
+    "arm_pairs": [],                                        # (left, right) blocks to pool
+    "scale_groups": [{"blocks": ["pos"], "summary_key": "s_pos"}, ...],  # blocks sharing one S_g
+    "summary_scale_fields": [("ActionBlockScale_pos", "s_pos")],
+    "block_types": {"rot": "rot6d"},                       # geodesic distance for 6-D rotations
+}
+```
+
+Blocks are scored independently; `block_types[k] = "rot6d"` uses SO(3) geodesic
+distance, everything else is L2. `scale_groups` decide which blocks share a
+threshold (e.g. left/right arms).
+
 ## Module map
 
 | Module | Purpose |
