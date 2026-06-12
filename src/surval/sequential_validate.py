@@ -237,17 +237,17 @@ def _rows_to_demo_trajectories(actions, demo_ids, index_in_demo, action_dim):
 
 def _build_sequential_summary(
     all_scores_chunk,
-    matched_prefix_lengths,
+    traj_survivals,
     valid_loss=None,
     valid_off=None,
 ):
     """Build the aggregate sequential-validation summary dict (core fields)."""
     s_chunk_global = float(np.mean(all_scores_chunk))
     summary = {
-        "PrefixSurvival_Score": s_chunk_global,
-        "PrefixSurvival_Loss": 1.0 - s_chunk_global,
-        # Mean(sum_t s_t) per trajectory: larger means longer valid prefix on average.
-        "PrefixSurvival_MatchedPrefixLen_MeanPerTraj": float(np.mean(matched_prefix_lengths)),
+        "SurVAL_Score": s_chunk_global,
+        "SurVAL_Loss": 1.0 - s_chunk_global,
+        # Mean(sum_t s_t) per trajectory: larger means longer survival on average.
+        "SurVAL_MeanTrajSurvival": float(np.mean(traj_survivals)),
     }
     if valid_loss is not None and not np.isnan(valid_loss):
         summary["valid_loss"] = float(valid_loss)
@@ -739,8 +739,8 @@ def _compute_from_cache(
     pred_actions_samples,
     ta,
     num_diffusion_samples,
-    prefix_epsilon_soft,
-    prefix_scoring_mode,
+    survival_epsilon,
+    scoring_mode,
     action_space_config,
     *,
     block_scale_quantile=0.99,
@@ -751,8 +751,8 @@ def _compute_from_cache(
     threshold_quantile=None,
     chunk_top_frac=0.2,
     skip_intermediate_on_pass=True,
-    prefix_soft_lse_tau=1.0,
-    prefix_time_reduction="product",
+    soft_lse_tau=1.0,
+    time_reduction="product",
     valid_loss=None,
     valid_off=None,
 ):
@@ -763,7 +763,7 @@ def _compute_from_cache(
         )
     s_cached, n_rows, t_cached, a_cached = pred_actions_samples.shape
     if n_rows == 0 or t_cached == 0:
-        return {"PrefixSurvival_Score": 0.0, "PrefixSurvival_Loss": 1.0}, []
+        return {"SurVAL_Score": 0.0, "SurVAL_Loss": 1.0}, []
     if num_diffusion_samples <= 0:
         raise ValueError("num_diffusion_samples must be positive.")
     if num_diffusion_samples > s_cached:
@@ -853,7 +853,7 @@ def _compute_from_cache(
 
     num_blocks = len(block_names)
 
-    # Per-block step errors, then soft prefix-survival aggregation.
+    # Per-block step errors, then soft survival aggregation.
     step_err_pb = _compute_per_block_scaled_step_errors(
         pred=pred,
         gt=gt,
@@ -866,7 +866,7 @@ def _compute_from_cache(
     row_stride = int(ta_eff) if skip_intermediate_on_pass else 1
     keep_idx = [i for i in range(n_rows) if (int(index_in_demo[i]) % row_stride) == 0]
     if not keep_idx:
-        return {"PrefixSurvival_Score": 0.0, "PrefixSurvival_Loss": 1.0}, []
+        return {"SurVAL_Score": 0.0, "SurVAL_Loss": 1.0}, []
 
     chunk_per_block = []
     for b in range(num_blocks):
@@ -883,10 +883,10 @@ def _compute_from_cache(
 
     demo_ids_sorted = sorted(set.intersection(*(set(d.keys()) for d in by_demo_blocks)))
     if not demo_ids_sorted:
-        return {"PrefixSurvival_Score": 0.0, "PrefixSurvival_Loss": 1.0}, []
+        return {"SurVAL_Score": 0.0, "SurVAL_Loss": 1.0}, []
 
     all_scores_chunk = []
-    matched_prefix_lengths = []
+    traj_survivals = []
     per_episode = []
     # Track ratio of (t, g) entries where e_{t,g} > S_g (err_mat is already
     # scaled by 1/S_g, so the test is err_mat > 1.0).
@@ -894,8 +894,8 @@ def _compute_from_cache(
     violation_count = 0
     per_block_total = np.zeros(num_blocks, dtype=np.int64)
     per_block_viol = np.zeros(num_blocks, dtype=np.int64)
-    eps_s = float(prefix_epsilon_soft)
-    lse_tau = max(float(prefix_soft_lse_tau), 1e-8)
+    eps_s = float(survival_epsilon)
+    lse_tau = max(float(soft_lse_tau), 1e-8)
 
     for did in demo_ids_sorted:
         pairs0 = sorted(by_demo_blocks[0][did], key=lambda x: x[0])
@@ -920,12 +920,12 @@ def _compute_from_cache(
         per_block_total += int(t_len)
         per_block_viol += np.sum(viol_mask, axis=1).astype(np.int64)
 
-        # Soft prefix survival. Per-block soft pass probability
+        # Soft survival. Per-block soft pass probability
         #   p_b(t) = exp(-max(0, e_{b,t} - eps)),
         # collapsed across blocks by a LogSumExp smooth-min
         #   e_t = -(1/τ) · log mean_b exp(-τ · p_b)
         # (τ→∞ ⇒ worst block; τ→0 ⇒ mean), then reduced over time into the
-        # prefix-survival vector s (cumprod, or cumulative mean).
+        # survival vector s (cumprod, or cumulative mean).
         e_t = np.zeros(t_len, dtype=np.float64)
         for t in range(t_len):
             p_b = np.exp(-np.maximum(0.0, err_mat[:, t] - eps_s))
@@ -933,29 +933,29 @@ def _compute_from_cache(
             m = float(neg.max())
             log_mean_exp = float(np.log(np.mean(np.exp(neg - m)))) + m
             e_t[t] = float(-log_mean_exp / lse_tau)
-        if str(prefix_time_reduction).lower() == "mean":
+        if str(time_reduction).lower() == "mean":
             s = np.cumsum(e_t) / np.arange(1, t_len + 1, dtype=np.float64)
         else:
             s = np.cumprod(e_t)
-        if str(prefix_scoring_mode) == "weighted_sum":
+        if str(scoring_mode) == "weighted_sum":
             w = 1.0 - np.arange(t_len, dtype=np.float64) / max(t_len, 1)
             score_d = float(np.dot(w, s))
         else:
             score_d = float(np.mean(s))
         all_scores_chunk.append(score_d)
-        matched_prefix_lengths.append(float(np.mean(s)))
+        traj_survivals.append(float(np.mean(s)))
         per_episode.append(
             {
                 "demo_id": did,
-                "PrefixSurvival_Score": score_d,
-                "PrefixSurvival_Loss": 1.0 - score_d,
+                "SurVAL_Score": score_d,
+                "SurVAL_Loss": 1.0 - score_d,
                 "T": t_len,
-                "matched_prefix_length": float(np.mean(s)),
+                "traj_survival": float(np.mean(s)),
             }
         )
 
     if not all_scores_chunk:
-        return {"PrefixSurvival_Score": 0.0, "PrefixSurvival_Loss": 1.0}, []
+        return {"SurVAL_Score": 0.0, "SurVAL_Loss": 1.0}, []
 
     if violation_total > 0:
         overall_ratio = violation_count / violation_total
@@ -968,7 +968,7 @@ def _compute_from_cache(
 
     summary = _build_sequential_summary(
         all_scores_chunk=all_scores_chunk,
-        matched_prefix_lengths=matched_prefix_lengths,
+        traj_survivals=traj_survivals,
         valid_loss=valid_loss,
         valid_off=valid_off,
     )
@@ -1011,7 +1011,7 @@ def _compute_from_cache(
 # ---------------------------------------------------------------------------
 
 _SUMMARY_METRICS = [
-    "PrefixSurvival_Score",
+    "SurVAL_Score",
     "ActionL1_mean",
     "ActionL1_best",
     "ActionL2_mean",
@@ -1057,7 +1057,7 @@ def _print_checkpoint_metrics(
         summary = r.get("summary", {})
         vsummary = r.get("valid_summary", {})
 
-        per_metric["PrefixSurvival_Score"][s] = summary.get("PrefixSurvival_Score")
+        per_metric["SurVAL_Score"][s] = summary.get("SurVAL_Score")
         per_metric["ActionL1_mean"][s] = summary.get("ActionL1_mean")
         per_metric["ActionL1_best"][s] = summary.get("ActionL1_best")
         per_metric["ActionL2_mean"][s] = summary.get("ActionL2_mean")
@@ -1117,7 +1117,7 @@ def _run_single_cache_group(group, args, action_space_config):
     tb_dir = os.path.join(group_out_dir, "tb")
     writer = SummaryWriter(tb_dir)
     results = []
-    prefix_scores = []
+    surval_scores = []
 
     load_obs = bool(getattr(args, "load_cache_obs_features", False))
 
@@ -1143,8 +1143,8 @@ def _run_single_cache_group(group, args, action_space_config):
             pred_actions_samples=pred_actions_samples,
             ta=args.ta,
             num_diffusion_samples=args.num_diffusion_samples,
-            prefix_epsilon_soft=1.0,
-            prefix_scoring_mode=args.prefix_scoring_mode,
+            survival_epsilon=1.0,
+            scoring_mode=args.scoring_mode,
             action_space_config=action_space_config,
             block_scale_quantile=args.block_scale_quantile,
             block_scale_local_progress_window=args.block_scale_local_progress_window,
@@ -1154,8 +1154,8 @@ def _run_single_cache_group(group, args, action_space_config):
             threshold_quantile=getattr(args, "threshold_quantile", None),
             chunk_top_frac=args.chunk_top_frac,
             skip_intermediate_on_pass=args.skip_intermediate_on_pass,
-            prefix_soft_lse_tau=args.prefix_soft_lse_tau,
-            prefix_time_reduction=getattr(args, "prefix_time_reduction", "product"),
+            soft_lse_tau=args.soft_lse_tau,
+            time_reduction=getattr(args, "time_reduction", "product"),
             valid_loss=valid_loss,
             valid_off=valid_off,
         )
@@ -1167,8 +1167,8 @@ def _run_single_cache_group(group, args, action_space_config):
         if valid_off is not None and not np.isnan(valid_off):
             writer.add_scalar("Valid/Off_Manifold_Norm", float(valid_off), int(step))
 
-        if "PrefixSurvival_Score" in seq_summary:
-            prefix_scores.append(float(seq_summary["PrefixSurvival_Score"]))
+        if "SurVAL_Score" in seq_summary:
+            surval_scores.append(float(seq_summary["SurVAL_Score"]))
         # print(
         #     f"\n[cache] group={rel_dir} step={int(step)} file={cache_path}",
         #     flush=True,
@@ -1205,7 +1205,7 @@ def _run_single_cache_group(group, args, action_space_config):
         "num_results": len(results),
         f"{time_key}_min": int(min(steps)) if steps else None,
         f"{time_key}_max": int(max(steps)) if steps else None,
-        "mean_prefix_survival_score": (float(np.mean(prefix_scores)) if prefix_scores else None),
+        "mean_surval_score": (float(np.mean(surval_scores)) if surval_scores else None),
         "results_json": out_json,
         "tb_dir": tb_dir,
     }
@@ -1225,7 +1225,7 @@ def _flatten_scale_groups(action_space_config):
     The input dict is not mutated. summary_scale_fields is left as-is, which
     means consumer-supplied summary scalars keyed by pooled group names won't be
     populated under the flat regime — that's intentional for ablation runs
-    (the PrefixSurvival_Score metric is unaffected).
+    (the SurVAL_Score metric is unaffected).
     """
     new_cfg = dict(action_space_config)
     new_cfg["scale_groups"] = [
@@ -1308,12 +1308,12 @@ def add_common_args(parser):
     )
     parser.add_argument("--num-diffusion-samples", type=int, default=1)
     parser.add_argument(
-        "--prefix-scoring-mode",
+        "--scoring-mode",
         type=str,
         default="mean",
         choices=["mean", "weighted_sum"],
         help=(
-            "How to reduce the prefix-survival vector s into a per-demo score. "
+            "How to reduce the survival vector s into a per-demo score. "
             "'mean' (default): mean_t s_t. "
             "'weighted_sum': linear front-weighting sum_t (1-t/T)*s_t / sum_t (1-t/T)."
         ),
@@ -1413,7 +1413,7 @@ def add_common_args(parser):
     )
     parser.set_defaults(skip_intermediate_on_pass=True)
     parser.add_argument(
-        "--prefix-soft-lse-tau",
+        "--soft-lse-tau",
         type=float,
         default=1.0,
         help=(
@@ -1436,18 +1436,17 @@ def add_common_args(parser):
         ),
     )
     parser.add_argument(
-        "--prefix-time-reduction",
+        "--time-reduction",
         type=str,
         default="product",
         choices=["product", "mean"],
         help=(
-            "How to reduce per-timestep survival values e_t into the prefix-survival "
-            "vector s used by --prefix-scoring-mode. "
-            "'product' (default): s = cumprod(e_t) — first-failure cliff (current "
-            "SURVAL behavior). "
-            "'mean': s = cumsum(e_t) / (1..T) — cumulative mean, no cliff. Ablation "
-            "variant that replaces the multiplicative time aggregator with an additive "
-            "one. Applies to both --prefix-mode=soft and --prefix-mode=hard."
+            "How to reduce per-timestep survival probabilities p_t into the "
+            "survival vector s used by --scoring-mode. "
+            "'product' (default): s = cumprod(p_t) — the SurVAL cumulative product "
+            "(a single catastrophic step cascades through all subsequent steps). "
+            "'mean': s = cumsum(p_t) / (1..T) — cumulative mean, no cliff. Ablation "
+            "variant that replaces the multiplicative aggregation with an additive one."
         ),
     )
     parser.add_argument(

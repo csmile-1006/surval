@@ -1,13 +1,16 @@
 # surval
 
+Open-source implementation of **SurVAL: Rollout-Free Survival Validation for
+Robot Policies** ([citation below](#citation)).
+
 Rank training checkpoints by how well a policy's predicted actions survive
-against the ground-truth trajectory — the **PrefixSurvival** metric — computed
+against the ground-truth trajectory — the **SurVAL** metric — computed
 from a cached HDF5 of rollouts, with no simulator in the loop. surval is a
 library: you produce a cache, surval scores it, and you correlate the score
 against real success rate.
 
 ```
-produce cache  ──►  score (PrefixSurvival / checkpoint)  ──►  correlate vs. success rate
+produce cache  ──►  score (SurVAL / checkpoint)  ──►  correlate vs. success rate
 ```
 
 ## Install
@@ -82,12 +85,12 @@ both fully open-source, runnable on a GPU.
 
 ## Scoring + the metric (3 scripts, surval-only)
 
-The proxy `B` (PrefixSurvival) comes from surval scoring the cache; the **only**
+The proxy `B` (SurVAL) comes from surval scoring the cache; the **only**
 things read from TensorBoard are `success_rate` (ground truth `A`) and
 `valid_loss`.
 
 ```bash
-# 1. score a cache dir -> per-step proxy npz (PrefixSurvival, valid_loss, action_l2)
+# 1. score a cache dir -> per-step proxy npz (SurVAL, valid_loss, action_l2)
 python scripts/score_seqcache.py --cache-dir <caches> --output-dir <out> \
     --action-space droid --block-scale-method inter
 
@@ -122,9 +125,10 @@ The per-block tolerance `S_g` the errors are compared against:
   --threshold-quantile 0.9`. See
   [`src/surval/local_threshold/README.md`](src/surval/local_threshold/README.md).
 
-Prefix survival is soft (LogSumExp smooth-min over blocks, `--prefix-soft-lse-tau`);
-ablation knobs `--scale-groups-mode {grouped,flat}` and `--prefix-time-reduction
-{product,mean}` (`tests/ablation_test.py`).
+Per-step survival probabilities are aggregated across blocks by a soft LogSumExp
+smooth-min (`--soft-lse-tau`) and over time by a cumulative product; ablation
+knobs `--scale-groups-mode {grouped,flat}` and `--time-reduction {product,mean}`
+(`tests/ablation_test.py`).
 
 ## Extending
 
@@ -137,7 +141,7 @@ Adding a new **dataset**, **model**, or **action space** →
 |---|---|
 | `surval.ingest` | Generic cache builder + dataset readers (robomimic/robocasa HDF5, LeRobot) |
 | `surval.cache_io` | Canonical HDF5 cache writer + helpers |
-| `surval.sequential_validate` | Reads caches; computes PrefixSurvival / per-block scaled-error metrics |
+| `surval.sequential_validate` | Reads caches; computes SurVAL / per-block scaled-error metrics |
 | `surval.action_spaces` | Built-in block layouts (droid/gripper/dex/humanoid/gr1) |
 | `surval.local_threshold` | State-conditional threshold maps (`state_inter`, `state_intra`) |
 | `surval.tb_aggregate` | TB scalar I/O + cross-seed proxy metrics |
@@ -147,4 +151,18 @@ Adding a new **dataset**, **model**, or **action space** →
 
 ```bash
 pip install -e .[full,dev] && pytest tests/
+```
+
+## Citation
+
+If you use surval, please cite the SurVAL paper:
+
+```bibtex
+@inproceedings{surval2026,
+  title     = {{SurVAL}: Rollout-Free Survival Validation for Robot Policies},
+  author    = {Anonymous},
+  booktitle = {Conference on Robot Learning (CoRL)},
+  year      = {2026},
+  note      = {Under review},
+}
 ```

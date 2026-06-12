@@ -94,7 +94,7 @@ def test_cache_round_trip_via_loader():
             "event_file": None,
             "use_only_latest": True,
             "tags": {
-                "SequentialValid/PrefixSurvival_Score": {
+                "SequentialValid/SurVAL_Score": {
                     "steps": [0, 1, 2], "values": [0.2, 0.5, 0.8],
                 },
                 "SequentialValid/ActionL2_mean": {
@@ -117,7 +117,7 @@ def test_cache_round_trip_via_loader():
         assert values.tolist() == [0.5, 0.3, 0.2]
 
         _, sv = loader.load_seqval_series(
-            seed_name, hp_dir, group_dir, "SequentialValid/PrefixSurvival_Score",
+            seed_name, hp_dir, group_dir, "SequentialValid/SurVAL_Score",
         )
         assert sv.tolist() == [0.2, 0.5, 0.8]
 

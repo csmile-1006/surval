@@ -1,7 +1,7 @@
 """Correlate a proxy against the real success rate — the whole metric step.
 
 Loads the ground-truth npz from ``extract_tb_metrics.py`` (success_rate = A) and
-the proxy npz from ``score_seqcache.py`` (B = prefix_survival / valid_loss /
+the proxy npz from ``score_seqcache.py`` (B = surval / valid_loss /
 action_l2), aligns them by training step, and reports how well the proxy ranks
 checkpoints the way success rate does (spearman / hit@k / nregret / mmrv).
 
@@ -54,8 +54,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gt", nargs="+", required=True, help="Ground-truth npz(s) from extract_tb_metrics.py.")
     ap.add_argument("--proxy", nargs="+", required=True, help="Proxy npz(s) from score_seqcache.py (paired by order).")
-    ap.add_argument("--proxy-key", default="prefix_survival",
-                    choices=["prefix_survival", "valid_loss", "action_l2"])
+    ap.add_argument("--proxy-key", default="surval",
+                    choices=["surval", "valid_loss", "action_l2"])
     ap.add_argument("--negate", choices=["auto", "yes", "no"], default="auto",
                     help="Negate B so higher=better. 'auto' negates the lower-is-better proxies.")
     ap.add_argument("--k-list", nargs="+", type=int, default=[1, 2, 3, 5])

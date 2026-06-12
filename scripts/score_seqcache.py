@@ -2,7 +2,7 @@
 
 Runs ``surval.sequential_validate`` over a cache dir using a built-in action
 space (droid/gripper/dex/humanoid), then saves the per-checkpoint proxy values
-(PrefixSurvival_Score, valid_loss, ActionL2_mean) as a small ``.npz`` keyed by
+(SurVAL_Score, valid_loss, ActionL2_mean) as a small ``.npz`` keyed by
 step. That npz is the proxy "B" consumed by ``correlate_metrics.py``.
 
 This is the whole metric-from-cache path in one surval-only command — no openpi
@@ -57,23 +57,23 @@ def main():
     for r in results:
         s = r.get("summary", {})
         rows.append((int(r["step"]),
-                     _f(s.get("PrefixSurvival_Score")),
+                     _f(s.get("SurVAL_Score")),
                      _f(s.get("valid_loss")),
                      _f(s.get("ActionL2_mean"))))
     rows.sort(key=lambda x: x[0])
     steps = np.array([r[0] for r in rows], dtype=np.int64)
-    prefix_survival = np.array([r[1] for r in rows], dtype=np.float64)
+    surval = np.array([r[1] for r in rows], dtype=np.float64)
     valid_loss = np.array([r[2] for r in rows], dtype=np.float64)
     action_l2 = np.array([r[3] for r in rows], dtype=np.float64)
 
     proxy_out = args.proxy_out or os.path.join(os.path.abspath(os.path.expanduser(args.output_dir)),
                                                "proxy_metrics.npz")
-    np.savez(proxy_out, steps=steps, prefix_survival=prefix_survival,
+    np.savez(proxy_out, steps=steps, surval=surval,
              valid_loss=valid_loss, action_l2=action_l2,
              action_space=args.action_space, block_scale_method=str(args.block_scale_method))
     print(f"\n[score] {args.action_space} | method={args.block_scale_method} | {len(steps)} checkpoint(s)")
-    print(f"{'step':>8} {'PrefixSurvival':>15} {'valid_loss':>12} {'ActionL2':>12}")
-    for st, ps, vl, al in zip(steps, prefix_survival, valid_loss, action_l2):
+    print(f"{'step':>8} {'SurVAL':>15} {'valid_loss':>12} {'ActionL2':>12}")
+    for st, ps, vl, al in zip(steps, surval, valid_loss, action_l2):
         print(f"{st:>8} {ps:>15.6f} {vl:>12.6f} {al:>12.6f}")
     print(f"[score] saved proxy npz -> {proxy_out}")
 

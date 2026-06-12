@@ -159,7 +159,7 @@ def main():
         validate_common_args(a, num_blocks=len(GR1["block_names"]))
         run(a, GR1)
         s = json.load(open(glob.glob(f"{out_parent}/out/*group_summary.json")[0]))[0]
-        print(f"[score] inter (state-free)  PrefixSurvival = {s.get('mean_prefix_survival_score')}")
+        print(f"[score] inter (state-free)  SurVAL = {s.get('mean_surval_score')}")
 
 
 if __name__ == "__main__":
