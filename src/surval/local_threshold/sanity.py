@@ -7,7 +7,7 @@ A failed check raises (per spec §3.5: do not silently warn).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 import os
 
 import numpy as np
@@ -31,17 +31,6 @@ def _import_plt():
 
 
 # -------- Phase 1 sanity --------
-
-
-def check_encoder_determinism(encoder, n_images: int = 2) -> str:
-    rng = np.random.default_rng(0)
-    img = rng.integers(0, 255, size=(n_images, encoder.cfg.image_size, encoder.cfg.image_size, 3), dtype=np.uint8)
-    f1 = encoder.encode(img).numpy()
-    f2 = encoder.encode(img).numpy()
-    diff = float(np.max(np.abs(f1 - f2)))
-    if diff >= 1e-5:
-        raise AssertionError(f"encoder non-deterministic: max abs diff = {diff}")
-    return f"- **Encoder determinism**: PASS (max abs diff = {diff:.2e})\n"
 
 
 def check_modality_balance(
@@ -88,61 +77,6 @@ def check_index_round_trip(db: StateDatabase, n_queries: int = 100) -> str:
     if max_d > 1e-4:
         raise AssertionError(f"Self-query distance {max_d} too large")
     return f"- **Index round-trip**: PASS (max self-distance = {max_d:.2e})\n"
-
-
-def visual_neighbor_inspection(
-    db: StateDatabase,
-    get_image: Callable[[int, str], np.ndarray],  # (state_idx, view) -> uint8 (H, W, 3)
-    output_dir: str,
-    n_queries: int = 5,
-    k: int = 10,
-) -> str:
-    """Save top-k neighbor image grids for a few random queries.
-
-    ``get_image`` is a callable that returns the raw image for any
-    (state_idx, view) pair — the function uses it for both the queries it
-    samples and the FAISS neighbors it discovers, so the caller does not need
-    to pre-build a full lookup dict.
-    """
-    plt = _import_plt()
-    _ensure_dir(output_dir)
-    rng = np.random.default_rng(0)
-    n = db.n_states
-    n_queries = min(n_queries, n)
-    query_idx = rng.choice(n, size=n_queries, replace=False)
-    q_emb = db.embeddings[query_idx]
-    _, indices = db.query(q_emb, k=k + 1)
-
-    views = list(db.cfg.image_views)
-
-    paths = []
-    for q_pos, q in enumerate(query_idx):
-        nbs = [int(x) for x in indices[q_pos] if int(x) != int(q)][:k]
-        n_views = len(views)
-        fig, axes = plt.subplots(n_views, k + 1, figsize=(2 * (k + 1), 2 * n_views))
-        if n_views == 1:
-            axes = axes[None, :]
-        for vi, view in enumerate(views):
-            axes[vi, 0].imshow(get_image(int(q), view))
-            axes[vi, 0].set_title(f"Q (idx={int(q)}, t={int(db.records.t[int(q)])})", fontsize=7)
-            axes[vi, 0].axis("off")
-            for j, nb in enumerate(nbs):
-                axes[vi, j + 1].imshow(get_image(nb, view))
-                axes[vi, j + 1].set_title(
-                    f"nb (d={int(db.records.demo_id_int[nb])}, t={int(db.records.t[nb])})",
-                    fontsize=7,
-                )
-                axes[vi, j + 1].axis("off")
-        out_path = os.path.join(output_dir, f"phase1_neighbors_q{q_pos:02d}.png")
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=80)
-        plt.close(fig)
-        paths.append(out_path)
-
-    md = "- **Visual neighbor inspection**: figures saved\n"
-    for p in paths:
-        md += f"  - `{p}`\n"
-    return md
 
 
 # -------- Phase 2 sanity --------

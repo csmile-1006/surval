@@ -7,8 +7,9 @@ from the hash when empty so existing joint-velocity artifacts keep their
 hash after the field was added.)
 
 Notes specific to this codebase:
-- Image keys come from ``DroidRldsSequentialDataset``: ``image`` (exterior) and
-  ``wrist_image`` (wrist). There are exactly 2 views.
+- State features come from the policy's own per-row feature output, stored as
+  ``obs_features`` in the seqcache (a VLM prefix embedding for openpi/RLDS, or a
+  model encoder output for robomimic).
 - Proprio keys are ``joint_position`` (7), ``cartesian_position`` (6),
   ``gripper_position`` (1).
 
@@ -66,14 +67,19 @@ def _action_space_block_spec(
 
 @dataclass(frozen=True)
 class LocalThresholdConfig:
-    # ----- Encoder -----
-    encoder_name: str = "dinov2_vitb14"  # dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14
-    encoder_pool: str = "cls"  # "cls" | "mean_patch"
-    image_size: int = 224
-    image_views: tuple[str, ...] = ("image", "wrist_image")
+    # ----- Feature source -----
+    # State embeddings come from the policy's own feature output (the per-row
+    # ``obs_features`` stored in the seqcache — e.g. a VLM prefix embedding or a
+    # model encoder output), normalized to unit length. These image/encoder
+    # fields are inert metadata kept only for on-disk config/hash stability;
+    # builders set ``encoder_name="precomputed_obs_features"`` / ``use_image=False``.
+    encoder_name: str = "precomputed_obs_features"
+    encoder_pool: str = "cls"
+    image_size: int = 0
+    image_views: tuple[str, ...] = ("obs_features",)
 
     # ----- State vector composition -----
-    use_image: bool = True
+    use_image: bool = False
     use_proprio: bool = True
     proprio_keys: tuple[str, ...] = ("joint_position", "cartesian_position", "gripper_position")
     # State window: gather past K frames (causal, clamped at demo start) for each
@@ -152,9 +158,9 @@ class LocalThresholdConfig:
     # ----- Caching -----
     cache_root: str = "./cache/local_threshold"
 
-    # ----- Encoder runtime -----
-    encoder_batch_size: int = 128
-    encoder_device: str = "cuda"
+    # ----- Encoder runtime (inert; retained for config/hash stability) -----
+    encoder_batch_size: int = 1
+    encoder_device: str = "cpu"
 
     def block_slice_dict(self) -> dict[str, slice]:
         """Convert the tuple form to ``{block_name: slice}``."""

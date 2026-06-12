@@ -31,8 +31,10 @@ def test_proprio_normalizer_round_trip():
 
 
 def test_compose_state_unit_norm():
+    # compose_state_vectors_batch is feature-source-agnostic: the "image" views
+    # are arbitrary precomputed per-view feature vectors.
     cfg = LocalThresholdConfig(
-        encoder_name="dinov2_vits14",
+        use_image=True,
         image_views=("image", "wrist_image"),
         proprio_keys=("joint_position", "cartesian_position", "gripper_position"),
     )
@@ -52,7 +54,7 @@ def test_compose_state_unit_norm():
 
 
 def test_modality_block_norms_balanced():
-    cfg = LocalThresholdConfig(encoder_name="dinov2_vits14")
+    cfg = LocalThresholdConfig(use_image=True, image_views=("image", "wrist_image"))
     rng = np.random.default_rng(2)
     n, d_img = 1000, 384
     img_feats = {
@@ -95,7 +97,8 @@ def test_build_window_indices_clamps_at_demo_start():
 
 def test_compose_state_window_concat_doubles_image_dim():
     cfg = LocalThresholdConfig(
-        encoder_name="dinov2_vits14",
+        use_image=True,
+        image_views=("image", "wrist_image"),
         state_window_size=2,
         state_window_aggregation="concat",
     )
@@ -118,7 +121,8 @@ def test_compose_state_window_concat_doubles_image_dim():
 
 def test_compose_state_window_mean_keeps_dim():
     cfg = LocalThresholdConfig(
-        encoder_name="dinov2_vits14",
+        use_image=True,
+        image_views=("image", "wrist_image"),
         state_window_size=3,
         state_window_aggregation="mean",
     )
@@ -141,7 +145,7 @@ def test_compose_state_window_mean_keeps_dim():
 def test_compose_state_window_k1_matches_no_window():
     """K=1 (whether passed as identity indices or None) must match the
     single-frame baseline bit-for-bit."""
-    cfg = LocalThresholdConfig(encoder_name="dinov2_vits14", state_window_size=1)
+    cfg = LocalThresholdConfig(use_image=True, image_views=("image", "wrist_image"), state_window_size=1)
     rng = np.random.default_rng(5)
     n, d_img = 24, 384
     img_feats = {

@@ -1,126 +1,108 @@
 # SURVAL Local (State-Conditional) Thresholds
 
-State-conditional version of the SURVAL block thresholds. Where the existing
-global pipeline assigns a single per-block scale `S_g` over the entire val set,
-this module computes a *per-state* threshold `S_g(s)` that adapts to the local
-neighborhood of the state in image+proprio space.
+State-conditional version of the SURVAL block thresholds. Where the global
+pipeline assigns a single per-block scale `S_g` over the entire val set, this
+module computes a *per-state* threshold `S_g(s)` that adapts to the local
+neighborhood of the state in **feature space**.
+
+**Feature source: the policy's own output.** State embeddings are the per-row
+`obs_features` already stored in the seqcache — a VLM prefix embedding for
+openpi/RLDS, or a model encoder output for robomimic — L2-normalized. The
+feature the model computed once at caching time is reused as the retrieval key,
+so the state DB needs no raw-image access and no extra GPU pass.
 
 ## Pipeline
 
 ```
-RLDS val demos                                     ┌─ embeddings.npy   (N, D_state)
-   │                                               ├─ actions.npy      (N, 8)
+seqcache_*.hdf5  (with obs_features)               ┌─ embeddings.npy   (N, F)
+   │                                               ├─ actions.npy      (N, A)
    ▼                                               ├─ demo_id_int.npy  (N,)
-build_state_db.py                                  ├─ t.npy            (N,)
-   │  DINOv2 (frozen) + ProprioNormalizer  ──────► ├─ faiss.index
-   │                                               ├─ proprio_normalizer.pkl
+build_state_db_from_cache.py                       ├─ t.npy            (N,)
+   │  L2-normalize cached obs_features  ─────────► ├─ faiss.index
    ▼                                               └─ config.json
 state DB
    │                                               ┌─ thresholds       (N, n_blocks, n_quantiles)
    ▼                                               ├─ fallback_used    (N,)
 compute_local_thresholds.py                        ├─ n_neighbors_used (N,)
-   │  k-NN + filter + per-block L2 + multi-quantile├─ global_thresholds(n_blocks, n_quantiles)
-   │                                               └─ meta.json
+   │  k-NN + filter + per-block dist + multi-q     ├─ global_thresholds(n_blocks, n_quantiles)
    ▼
 threshold artifacts (per state, per block, per quantile)
 ```
 
-## Phase 0 — assumptions baked into this implementation
+Both scripts live in `surval/scripts/`.
 
-- **Action layouts** (selected via `--droid-action-space`):
-  - `joint_velocity` / `joint_position` — DROID 8-D
-    `[joint (7), gripper (1)]`. 7 single-dim joint blocks
-    (`joint_0..joint_6`), gripper excluded. Per-block distance is L2.
-  - `pos_rot6d` — DROID 10-D `[pos (3), rot_6d (6), gripper (1)]`. Blocks
-    are `pos` (L2 on 3-D translation) and `rot_6d` (SO(3) geodesic on the
-    6-D continuous rotation, matching the consumer in
-    `surval.sequential_validate`). Matches `DROID_ACTION_SPACE` in
-    `droid_policy_learning`'s `sequential_validate_from_cache_droid.py`.
-- **Distance dispatch**: blocks default to L2; `cfg.block_types["rot_6d"] =
-  "rot6d"` selects geodesic distance for the rotation block. Add new block
-  types by extending `_block_pair_distances` / `_block_chunk_motion_distance`
-  in `threshold.py`.
-- **Image views**: `image` (exterior_image_1_left) + `wrist_image`
-  (wrist_image_left), 2 views.
-- **Proprio**: `joint_position` (7) + `cartesian_position` (6) +
-  `gripper_position` (1) = 14-D, z-scored.
-- **Encoder**: DINOv2 (default `dinov2_vitb14`), frozen, CLS pooled.
-- **Subsampling**: none — uses every `passes_filter` step in the val split.
-  The DROID val split is expected to be ≤100,000 steps after upstream filtering.
-- **Quantiles**: stored as a tuple, default `(0.5, 0.75, 0.9, 0.95, 0.99)`.
-  All are computed in one pass; the consumer chooses which to apply.
+## Phase 0 — assumptions
+
+- **Feature source**: cached `obs_features` (model VLM / encoder output),
+  L2-normalized to unit length. Cosine retrieval via FAISS inner-product.
+- **Action layouts** (`--block-layout`): `droid_joint` (8-D DROID, 7 joint
+  blocks, L2), `droid_pos_rot6d` (10-D, `pos` L2 + `rot_6d` geodesic), plus
+  `gripper` (14-D), `dex` (24-D), `humanoid` (30-D, rot6d on the rotation
+  blocks). Must match the seqval consumer's `ACTION_SPACE`.
+- **Distance dispatch**: blocks default to L2; `block_types[...] = "rot6d"`
+  selects SO(3) geodesic distance. Extend `_block_pair_distances` /
+  `_block_chunk_motion_distance` in `threshold.py` for new types.
+- **Quantiles**: default `(0.5, 0.75, 0.9, 0.95, 0.99)`, all computed in one
+  pass; the consumer chooses which to apply at use time.
 
 ## Install
 
 ```bash
-uv sync --extra rlds --extra local_threshold
-# or pip install: faiss-cpu>=1.8.0
+pip install -e .[db]   # faiss-cpu for the state DB index
 ```
 
-DINOv2 is loaded via `torch.hub` from `facebookresearch/dinov2`. The first run
-downloads weights to `~/.cache/torch/hub/`.
+State features come from the cache (`obs_features`), so no extra dependency.
 
 ## Usage
 
-### Phase 1 — build the state DB
+### Phase 1 — build the state DB from a cache
 
 ```bash
-python scripts/build_state_db.py \
-    --data-dir /path/to/tfds_root \
-    --dataset-name droid \
-    --droid-action-space joint_velocity \   # or pos_rot6d for DROID 10-D
-    --max-samples 5000 \
-    --cache-root ./cache/local_threshold
+python scripts/build_state_db_from_cache.py \
+    --cache-file /path/to/seqcache_step_000600.hdf5 \
+    --output-dir ./cache/local_threshold/run0 \
+    --block-layout dex            # droid_joint | droid_pos_rot6d | gripper | dex | humanoid
 ```
 
-`--droid-action-space` controls action_dim / block_names / block_slices /
-block_types via the preset table in `config._action_space_block_spec`. Use
-`pos_rot6d` to build a state DB whose thresholds line up with
-`droid_policy_learning`'s 10-D `DROID_ACTION_SPACE`.
-
-Outputs go to `<cache-root>/<config_hash>/`. The hash is computed from every
-field of `LocalThresholdConfig`, so any change to encoder / image_size /
-proprio keys / quantile candidates produces a fresh artifact dir. Re-running
-with the same config skips work via the `state_db.complete` sentinel.
-
-Sanity report: `<config_hash>/sanity_phase1.md`. Includes encoder determinism,
-modality balance, FAISS round-trip, and visual neighbor figures.
+The cache **must** contain per-row `obs_features` (the model feature output). The
+build L2-normalizes them into retrieval embeddings, pulls per-state actions from
+`actions[:, 0, :]`, and keys the DB by `(demo_id, index_in_demo)` to match the
+consumer.
 
 ### Phase 2 — compute local + global thresholds
 
 ```bash
-python scripts/compute_local_thresholds.py \
-    --state-db-dir ./cache/local_threshold/<config_hash>/
+python scripts/compute_local_thresholds.py --state-db-dir ./cache/local_threshold/run0
 ```
 
-Outputs land at `<state-db-dir>/thresholds/`:
-
-- `local_threshold_map.npz` with arrays:
-  - `thresholds`: `(N, n_blocks, n_quantiles)` float32
-  - `fallback_used`: `(N,)` bool
-  - `n_neighbors_used`: `(N,)` int32
-  - `global_thresholds`: `(n_blocks, n_quantiles)` float32
-- `local_threshold_meta.json` — `block_names`, `quantiles`, `config_hash`
-- `global_thresholds.npz` — same global array, also exposed as a standalone file
-- `sanity_phase2.md` + `figures/`
-
-You can override threshold-pass-only knobs without rebuilding the DB:
+Outputs land at `<state-db-dir>/thresholds/` (`local_threshold_map.npz` with
+`thresholds`, `fallback_used`, `n_neighbors_used`, `global_thresholds`).
+Threshold-only knobs can be overridden without rebuilding the DB:
 
 ```bash
-python scripts/compute_local_thresholds.py \
-    --state-db-dir <dir> \
-    --quantiles 0.9 0.95 \
-    --k-neighbors 100 \
-    --pairwise-or-query-centered query_centered \
-    --output-subdir thresholds_qc
+python scripts/compute_local_thresholds.py --state-db-dir <dir> \
+    --quantiles 0.9 0.95 --k-neighbors 100 \
+    --pairwise-or-query-centered query_centered --output-subdir thresholds_qc
 ```
+
+### Phase 3 — score with state-conditional thresholds
+
+Point the seqval consumer at the DB:
+
+```bash
+python -m your_wrapper --cache-dir <caches> --output-dir <out> \
+    --block-scale-method state_inter --state-db-dir ./cache/local_threshold/run0 \
+    --threshold-quantile 0.9
+```
+
+(`state_intra` reads the `thresholds_intra_demo_sc/` subdir — build it with
+`compute_local_thresholds.py --scale-source intra_demo_sc`.)
 
 ## Multi-quantile lookup
 
 ```python
 from surval.local_threshold.threshold import LocalThresholdMap
-m = LocalThresholdMap.load("./cache/local_threshold/<hash>/thresholds")
-
+m = LocalThresholdMap.load("./cache/local_threshold/run0/thresholds")
 s_local = m.get(state_idx=42, block="joint_3", quantile=0.95)
 s_global = m.get_global(block="joint_3", quantile=0.95)
 ```
@@ -128,17 +110,8 @@ s_global = m.get_global(block="joint_3", quantile=0.95)
 ## Files
 
 - `config.py` — `LocalThresholdConfig` (frozen dataclass + `to_hash`)
-- `encoder.py` — `FrozenImageEncoder` (DINOv2 wrapper)
-- `state_embed.py` — composition + `ProprioNormalizer`
+- `state_embed.py` — feature/proprio composition + `ProprioNormalizer`
 - `database.py` — `StateDatabase` (FAISS + records)
 - `threshold.py` — global + local threshold computation, `LocalThresholdMap`
-- `sanity.py` — Phase 1 + Phase 2 sanity checks (raise on failure)
-- `*_test.py` — pytest tests (encoder test marked `@pytest.mark.gpu`)
-
-## Out of scope (per spec §7)
-
-- Phase 3 (policy scoring with local thresholds) — separate task.
-- Phase 4 (closed-loop validation).
-- Modifications to global threshold computation in
-  `sequential_validate_from_cache_base.py` (left untouched).
-- 14-D / 24-D action spaces (DROID 8-D and 10-D `pos_rot6d` only).
+- `sanity.py` — Phase 1/2 sanity checks (raise on failure)
+- `../../../scripts/build_state_db_from_cache.py`, `compute_local_thresholds.py`

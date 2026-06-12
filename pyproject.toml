@@ -12,12 +12,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-encoder = ["torch>=2.0"]
 db = ["faiss-cpu>=1.8.0"]
 sanity = ["matplotlib>=3.5"]
 omn = ["scikit-learn>=1.0"]
 lerobot = ["pyarrow>=12", "pandas>=1.5"]
-full = ["surval[encoder,db,sanity,omn,lerobot]"]
+full = ["surval[db,sanity,omn,lerobot]"]
 dev = ["pytest>=8.0"]
 
 [build-system]
