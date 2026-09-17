@@ -113,7 +113,8 @@ def write_seqcache_hdf5(
     actions: np.ndarray,
     pred_actions_list: Sequence[np.ndarray],
     checkpoint: str,
-    step: int,
+    step: int | None = None,
+    epoch: int | None = None,
     val_loss: float | None = None,
     off_manifold_norms: Mapping[int, float] | float | None = None,
     obs_features: np.ndarray | None = None,
@@ -137,9 +138,11 @@ def write_seqcache_hdf5(
     checkpoint
         Free-form checkpoint identifier (path or step descriptor).
     step
-        Integer training step (or epoch, for frameworks that count by epoch).
-        Stored as ``f.attrs["step"]`` so the reader doesn't need to parse the
-        filename.
+        Integer training step, stored as ``f.attrs["step"]``. Provide exactly
+        one of ``step`` or ``epoch``.
+    epoch
+        Integer epoch, stored as ``f.attrs["epoch"]``. Use an epoch filename
+        and the reader's ``mode="epoch"`` when supplying this argument.
     val_loss
         Validation loss scalar. Stored under ``metrics/valid/Loss``;
         ``NaN`` if ``None``.
@@ -150,6 +153,8 @@ def write_seqcache_hdf5(
     obs_features
         Optional state-feature array, ``[N, F]`` or ``[N, T, F]``.
     """
+    if (step is None) == (epoch is None):
+        raise ValueError("Provide exactly one of step or epoch")
     actions = np.asarray(actions)
     if actions.ndim != 3:
         raise ValueError(f"actions must have shape [N, T, A]; got {actions.shape}")
@@ -194,7 +199,7 @@ def write_seqcache_hdf5(
 
     with h5py.File(out_path, "w") as f:
         f.attrs["checkpoint"] = str(checkpoint)
-        f.attrs["step"] = int(step)
+        f.attrs["epoch" if epoch is not None else "step"] = int(epoch if epoch is not None else step)
         f.attrs["num_cache_samples"] = int(len(pred_arrs))
         f.attrs["num_rows"] = int(n_rows)
         f.attrs["num_steps"] = int(actions.shape[1])
@@ -336,7 +341,22 @@ def compute_off_manifold_errors(
     _, knn_indices = nbrs.kneighbors(state_features)
     knn_indices = knn_indices[:, 1 : k_nn + 1]
 
-    a_mat = expert_actions[knn_indices]  # [N, k, ac_dim]
+    errors = project_neighbor_actions(pred_actions, expert_actions[knn_indices])
+    return errors.reshape(b_dim, t_dim) if had_temporal_dim else errors
+
+
+def project_neighbor_actions(pred_actions: np.ndarray, a_mat: np.ndarray) -> np.ndarray:
+    """Residuals for already-selected expert neighbors [N, K, A].
+
+    Shared by legacy batch-local OMN and full-split DINO OMN. Retains the legacy
+    nearest-action convention for K=1 and ridge projection for K>1.
+    """
+    pred_actions, a_mat = np.asarray(pred_actions), np.asarray(a_mat)
+    if (pred_actions.ndim != 2 or a_mat.ndim != 3 or a_mat.shape[1] < 1
+            or pred_actions.shape != (a_mat.shape[0], a_mat.shape[2])
+            or not np.isfinite(pred_actions).all() or not np.isfinite(a_mat).all()):
+        raise ValueError("Expected finite predictions [N,A] and neighbors [N,K>=1,A]")
+    k_nn = a_mat.shape[1]
     if k_nn == 1:
         proj_a = a_mat[:, 0, :]
         errors = np.linalg.norm(pred_actions - proj_a, axis=1)
@@ -351,8 +371,6 @@ def compute_off_manifold_errors(
             proj_a = a_mat.mean(axis=1)
         errors = np.linalg.norm(pred_actions - proj_a, axis=1)
 
-    if had_temporal_dim:
-        return errors.reshape(b_dim, t_dim)
     return errors
 
 

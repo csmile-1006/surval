@@ -19,8 +19,11 @@ next to the ground-truth actions into an **HDF5 cache**. surval reads that cache
 and computes a **PrefixSurvival score** — the headline metric — that tells you
 which checkpoint / hyper-parameter is best, with no simulator in the loop.
 
-surval is **only a library**. It never trains a policy and never talks to a
-simulator. Two downstream projects produce caches and call into surval:
+The surval core never trains a policy or talks to a simulator. Optional
+[DROID evaluation commands](docs/DROID.md) run checkpoint caching, policy-encoder
+local thresholds and checkpoint-level metrics from this repository, using the
+installed `droid_policy_learning` / Octo dependencies. Two downstream projects
+also produce caches and call into surval:
 
 | Consumer | Stack | What it does |
 |---|---|---|

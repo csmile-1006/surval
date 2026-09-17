@@ -25,14 +25,15 @@ _FEATURE_DIMS = {
 
 
 class FrozenImageEncoder:
-    def __init__(self, cfg: LocalThresholdConfig, device: str | None = None):
+    def __init__(self, cfg: LocalThresholdConfig, device: str | None = None, *, revision: str | None = None):
         self.cfg = cfg
         self.device = torch.device(device or cfg.encoder_device)
         if cfg.encoder_name not in _FEATURE_DIMS:
             raise ValueError(f"Unknown encoder_name={cfg.encoder_name!r}. Known: {sorted(_FEATURE_DIMS)}")
         self._feature_dim = _FEATURE_DIMS[cfg.encoder_name]
 
-        model = torch.hub.load("facebookresearch/dinov2", cfg.encoder_name)
+        repository = "facebookresearch/dinov2" + (f":{revision}" if revision else "")
+        model = torch.hub.load(repository, cfg.encoder_name, trust_repo=True)
         model.eval()
         for p in model.parameters():
             p.requires_grad_(False)  # noqa: FBT003 — torch API takes a positional bool
