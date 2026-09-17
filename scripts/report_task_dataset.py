@@ -27,7 +27,7 @@ LOWER_IS_BETTER = {"mmrv", "nregret", "rank_pct"}
 BASELINE_TAGS = {
     "valid_loss": "Cache/Valid/Loss",
     "valid_omn":  "Cache/Valid/Off_Manifold_Norm",
-    "valid_mse":  "Cache/Valid/MSE",
+    "valid_mse":  "Cache/Valid/MSE_mean_pred",
 }
 OUR_TAG = "SequentialValid/PrefixSurvival_Score"
 OUR_NAME = "ours"

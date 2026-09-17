@@ -251,7 +251,7 @@ def main(argv=None):
                 our_stat = r["metrics"].get(args.rank_by, {})
                 base_loss = base_lookup.get((r["task"], r["dataset"], "Cache/Valid/Loss"), {})
                 base_omn  = base_lookup.get((r["task"], r["dataset"], "Cache/Valid/Off_Manifold_Norm"), {})
-                base_mse  = base_lookup.get((r["task"], r["dataset"], "Cache/Valid/MSE"), {})
+                base_mse  = base_lookup.get((r["task"], r["dataset"], "Cache/Valid/MSE_mean_pred"), {})
                 writer.writerow({
                     "task": r["task"], "dataset": r["dataset"], "rank_by": args.rank_by,
                     "our_method_mean":   our_stat.get("mean"),
@@ -290,7 +290,7 @@ def main(argv=None):
         ours = fmt(r["metrics"].get(args.rank_by, {}))
         loss = fmt(base_lookup_full.get((r["task"], r["dataset"], "Cache/Valid/Loss"), {}).get(args.rank_by, {}))
         omn  = fmt(base_lookup_full.get((r["task"], r["dataset"], "Cache/Valid/Off_Manifold_Norm"), {}).get(args.rank_by, {}))
-        mse  = fmt(base_lookup_full.get((r["task"], r["dataset"], "Cache/Valid/MSE"), {}).get(args.rank_by, {}))
+        mse  = fmt(base_lookup_full.get((r["task"], r["dataset"], "Cache/Valid/MSE_mean_pred"), {}).get(args.rank_by, {}))
         print(f"{r['task']:<22} {r['dataset'][:55]:<55} {ours:>22} {loss:>22} "
               f"{omn:>22} {mse:>22}")
 

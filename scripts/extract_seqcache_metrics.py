@@ -11,7 +11,7 @@ with three tags as (steps, values) series sorted by training epoch:
 
   Cache/Valid/Loss
   Cache/Valid/Off_Manifold_Norm
-  Cache/Valid/MSE                # mean((actions - pred_actions)**2) over all
+  Cache/Valid/MSE_mean_pred      # mean((mean_s(pred_actions) - actions)**2) over all
                                   # cache samples / demos / T / A dims
 
 These are HP-invariant per (seed, dataset), so one JSON per (seed, dataset)

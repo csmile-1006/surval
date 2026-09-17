@@ -9,9 +9,11 @@ this produces three (epoch -> value) series:
                                    present (new schema), else the flat
                                    metrics/valid/Off_Manifold_Norm scalar
                                    (legacy robomimic schema)
-  Cache/Valid/MSE                : mean((actions - pred_actions)**2) across
-                                   all demos / time / action dims, averaged
-                                   over cache samples (axis 0 of pred_actions)
+  Cache/Valid/MSE_mean_pred      : mean((mean_s(pred_actions) - actions)**2)
+                                   across all demos / time / action dims. The
+                                   per-sample mean is taken first, so this
+                                   measures point-estimate accuracy without
+                                   charging the policy for sampling variance.
 
 These three are HP-invariant per (seed, dataset), so they're written to a
 seed/dataset–keyed JSON cache:
@@ -34,31 +36,52 @@ import numpy as np
 # Tag names emitted by this extractor.
 LOSS_TAG = "Cache/Valid/Loss"
 OMN_TAG  = "Cache/Valid/Off_Manifold_Norm"
-# Five MSE variants (lower-is-better):
-#   MSE              : E_{s,n,t,a}[(pred - gt)^2]    (current, variance-included)
-#   MSE_mean_pred    : E_{n,t,a}[(mean_s(pred) - gt)^2]  (Bayes-optimal point-est)
-#   MSE_t0_only      : (mean_s(pred)[t=0] - gt[t=0])^2 over (n, a) — one-step
-#   MSE_tlast        : same but t=-1 — last horizon step
-#   MSE_per_dim_norm : ((mean_s(pred) - gt) / std_a)^2 averaged — scale-normalized
-MSE_TAG  = "Cache/Valid/MSE"
+# MSE baseline (lower-is-better):
+#   MSE_mean_pred : E_{n,t,a}[(mean_s(pred) - gt)^2]  (Bayes-optimal point-est)
+# The sample mean is taken before the error, so sampling variance is not
+# charged against a stochastic policy.
 MSE_MEAN_PRED_TAG = "Cache/Valid/MSE_mean_pred"
-MSE_T0_TAG        = "Cache/Valid/MSE_t0_only"
-MSE_TLAST_TAG     = "Cache/Valid/MSE_tlast"
-MSE_PER_DIM_TAG   = "Cache/Valid/MSE_per_dim_norm"
-MSE_VARIANT_TAGS = [
-    MSE_TAG, MSE_MEAN_PRED_TAG, MSE_T0_TAG, MSE_TLAST_TAG, MSE_PER_DIM_TAG,
-]
+MSE_VARIANT_TAGS = [MSE_MEAN_PRED_TAG]
 
 _EPOCH_RE = re.compile(r"epoch_(\d+)")
+# openpi checkpoints are indexed by training step, not epoch; both filename
+# conventions carry the same payload, so the extractor accepts either.
+_STEP_RE = re.compile(r"step_(\d+)")
+_INDEX_RE = re.compile(r"(?:epoch|step)_(\d+)")
+_CACHE_GLOBS = {"epoch": "seqcache_epoch_*.hdf5", "step": "seqcache_step_*.hdf5"}
 
 
-def _list_epoch_files(group_path: str) -> list:
-    """Return seqcache_epoch_*.hdf5 files sorted by epoch number."""
-    files = glob.glob(os.path.join(group_path, "seqcache_epoch_*.hdf5"))
-    def _key(p):
-        m = _EPOCH_RE.search(os.path.basename(p))
-        return int(m.group(1)) if m else -1
-    return sorted(files, key=_key)
+def _file_index(path: str) -> int:
+    """Checkpoint index parsed from a cache filename (epoch or step)."""
+    m = _INDEX_RE.search(os.path.basename(path))
+    return int(m.group(1)) if m else -1
+
+
+def detect_cache_mode(group_path: str) -> str | None:
+    """Return "epoch"/"step" for the caches present, or None when there are none.
+
+    Raises when a directory mixes both conventions, since the two indices are
+    not comparable and silently merging them would corrupt every series.
+    """
+    present = [m for m, g in _CACHE_GLOBS.items() if glob.glob(os.path.join(group_path, g))]
+    if len(present) > 1:
+        raise ValueError(f"Cache group mixes epoch and step files: {group_path}")
+    return present[0] if present else None
+
+
+def _list_epoch_files(group_path: str, mode: str | None = None) -> list:
+    """Return seqcache cache files sorted by their checkpoint index.
+
+    ``mode`` selects the filename convention; ``None`` auto-detects it so
+    existing epoch-based callers keep working unchanged.
+    """
+    mode = mode or detect_cache_mode(group_path)
+    if mode is None:
+        return []
+    if mode not in _CACHE_GLOBS:
+        raise ValueError(f"Unknown cache mode {mode!r}; choose one of {sorted(_CACHE_GLOBS)}")
+    files = glob.glob(os.path.join(group_path, _CACHE_GLOBS[mode]))
+    return sorted(files, key=_file_index)
 
 
 def _read_loss(h) -> float:
@@ -96,51 +119,12 @@ def _read_omn(h) -> float:
     return float("nan")
 
 
-def _gather_action_std(group_path: str, n_demos_cap: int = 400):
+def _read_mse_variants(h) -> dict:
     """
-    Estimate per-dim std of the GT actions for this (seed, dataset) group.
-    Used by the per-dim-normalized MSE variant. GT actions are the same across
-    epoch checkpoints, so we only scan one file.
-    """
-    try:
-        import h5py
-    except ImportError:
-        return None
-    files = _list_epoch_files(group_path)
-    if not files:
-        return None
-    try:
-        with h5py.File(files[0], "r") as h:
-            if "data" not in h:
-                return None
-            sums = None; sqs = None; cnt = 0
-            for dk in list(h["data"].keys())[:n_demos_cap]:
-                if "actions" not in h["data"][dk]:
-                    continue
-                a = h["data"][dk]["actions"][...].astype(np.float64, copy=False)
-                flat = a.reshape(-1, a.shape[-1])
-                if sums is None:
-                    sums = flat.sum(axis=0)
-                    sqs  = (flat * flat).sum(axis=0)
-                else:
-                    sums += flat.sum(axis=0)
-                    sqs  += (flat * flat).sum(axis=0)
-                cnt += flat.shape[0]
-            if cnt == 0:
-                return None
-            mean = sums / cnt
-            var  = sqs / cnt - mean * mean
-            return np.sqrt(np.maximum(var, 1e-8))
-    except OSError:
-        return None
-
-
-def _read_mse_variants(h, action_std) -> dict:
-    """
-    Five lower-is-better MSE variants computed from one epoch's HDF5 cache.
+    Lower-is-better MSE baseline computed from one checkpoint's HDF5 cache.
     Returns dict keyed by MSE_*_TAG names; NaN-on-failure per key.
     """
-    keys = [MSE_TAG, MSE_MEAN_PRED_TAG, MSE_T0_TAG, MSE_TLAST_TAG, MSE_PER_DIM_TAG]
+    keys = [MSE_MEAN_PRED_TAG]
     accum = {k: [0.0, 0] for k in keys}
     if "data" not in h:
         return {k: float("nan") for k in keys}
@@ -157,38 +141,16 @@ def _read_mse_variants(h, action_std) -> dict:
         a = min(gt.shape[2], pred.shape[3])
         gt_s = gt[:n, :t, :a]
         pr_s = pred[:, :n, :t, :a]
-        # Variant 1: current — E_{s,n,t,a}[(pred - gt)^2]
-        d = pr_s - gt_s[None, :, :, :]
-        accum[MSE_TAG][0] += float((d * d).sum()); accum[MSE_TAG][1] += int(d.size)
-        # Sample-mean prediction (used by variants 2/3/4/5)
+        # Sample-mean prediction first, then the error.
         pm = pr_s.mean(axis=0)                  # [n, t, a]
-        # Variant 2: mean_pred — Bayes-optimal point-estimate accuracy
         d = pm - gt_s
         accum[MSE_MEAN_PRED_TAG][0] += float((d * d).sum())
         accum[MSE_MEAN_PRED_TAG][1] += int(d.size)
-        # Variant 3: t0_only
-        d0 = pm[:, 0, :] - gt_s[:, 0, :]
-        accum[MSE_T0_TAG][0] += float((d0 * d0).sum())
-        accum[MSE_T0_TAG][1] += int(d0.size)
-        # Variant 4: tlast
-        dl = pm[:, -1, :] - gt_s[:, -1, :]
-        accum[MSE_TLAST_TAG][0] += float((dl * dl).sum())
-        accum[MSE_TLAST_TAG][1] += int(dl.size)
-        # Variant 5: per-dim normalized
-        if action_std is not None and len(action_std) >= a:
-            d = (pm - gt_s) / action_std[:a][None, None, :]
-            accum[MSE_PER_DIM_TAG][0] += float((d * d).sum())
-            accum[MSE_PER_DIM_TAG][1] += int(d.size)
     out = {}
     for k in keys:
         s, n = accum[k]
         out[k] = (s / n) if n > 0 else float("nan")
     return out
-
-
-def _read_mse(h) -> float:
-    """Back-compat single-variant reader (current MSE)."""
-    return _read_mse_variants(h, None)[MSE_TAG]
 
 
 def _read_step(h, fallback_path: str) -> int:
@@ -202,14 +164,14 @@ def _read_step(h, fallback_path: str) -> int:
             return int(h.attrs["epoch"])
         except Exception:
             pass
-    m = _EPOCH_RE.search(os.path.basename(fallback_path))
-    return int(m.group(1)) if m else -1
+    return _file_index(fallback_path)
 
 
-def extract_seqcache_metrics_for_group(group_path: str) -> dict:
+def extract_seqcache_metrics_for_group(group_path: str, mode: str | None = None) -> dict:
     """
     Walk one cache_group_dir and return a JSON-cache-shaped payload with the
-    three Cache/Valid/* tags as (steps, values) series sorted by epoch.
+    three Cache/Valid/* tags as (steps, values) series sorted by checkpoint
+    index (epoch or training step, whichever the cache files use).
 
     Returns a dict suitable for surval.tb_aggregate.tb_io.save_cache_file,
     including a "kind" marker so consumers can tell which extractor produced
@@ -220,8 +182,7 @@ def extract_seqcache_metrics_for_group(group_path: str) -> dict:
     except ImportError as exc:  # pragma: no cover
         raise ImportError("h5py is required to read seqcache HDF5 files.") from exc
 
-    files = _list_epoch_files(group_path)
-    action_std = _gather_action_std(group_path)
+    files = _list_epoch_files(group_path, mode)
     steps: list = []
     loss_vals: list = []
     omn_vals: list = []
@@ -234,7 +195,7 @@ def extract_seqcache_metrics_for_group(group_path: str) -> dict:
                 step = _read_step(h, path)
                 loss = _read_loss(h)
                 omn  = _read_omn(h)
-                mse_vals = _read_mse_variants(h, action_std)
+                mse_vals = _read_mse_variants(h)
         except OSError as exc:
             print(f"  [seqcache] skip unreadable file: {path} ({exc})")
             continue

@@ -477,8 +477,8 @@ python scripts/extract_seqcache_metrics.py --seqcache_root <root> --cache_dir <c
 ```
 
 This writes `<cache_dir>/seqcache_metrics/<seed>/<group>.json` with
-`Cache/Valid/Loss`, `Cache/Valid/Off_Manifold_Norm`, and five MSE variants
-(`MSE_t0_only`, `MSE_tlast`, ...; see `surval.tb_aggregate.seqcache_metrics`).
+`Cache/Valid/Loss`, `Cache/Valid/Off_Manifold_Norm`, and
+`Cache/Valid/MSE_mean_pred` (see `surval.tb_aggregate.seqcache_metrics`).
 Then point `aggregate_seqval_hparams.py` at them with
 `--force_seqcache_for_tag` / `--seqval_tag "Cache/Valid/Loss" ...`. The
 per-task baseline driver `run_baselines_per_task.py` →

@@ -70,11 +70,7 @@ PROXY_TAGS = [
     # value is reported for every HP under the same (seed, dataset).
     "Cache/Valid/Loss",
     "Cache/Valid/Off_Manifold_Norm",
-    "Cache/Valid/MSE",               # E_{s,n,t,a}[(pred - gt)^2]  (variance-included)
     "Cache/Valid/MSE_mean_pred",     # E_{n,t,a}[(mean_s(pred) - gt)^2]
-    "Cache/Valid/MSE_t0_only",       # one-step-ahead accuracy of mean prediction
-    "Cache/Valid/MSE_tlast",         # last-horizon-step accuracy of mean prediction
-    "Cache/Valid/MSE_per_dim_norm",  # ((mean_s(pred) - gt) / std_a)^2 per dim
 ]
 
 # Force these tags to load from the seqcache_metrics cache (skip the seqval

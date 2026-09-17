@@ -28,7 +28,7 @@ from collections import defaultdict
 BASELINE_TAGS = [
     "Cache/Valid/Loss",
     "Cache/Valid/Off_Manifold_Norm",
-    "Cache/Valid/MSE",
+    "Cache/Valid/MSE_mean_pred",
 ]
 
 PRIMARY_METRICS = [
@@ -168,7 +168,7 @@ def main(argv=None):
             short = (
                 "valid_loss" if proxy == "Cache/Valid/Loss"
                 else "valid_omn" if proxy == "Cache/Valid/Off_Manifold_Norm"
-                else "valid_mse" if proxy == "Cache/Valid/MSE"
+                else "valid_mse" if proxy == "Cache/Valid/MSE_mean_pred"
                 else proxy.replace("/", "_")
             )
             for metric in metric_order:
