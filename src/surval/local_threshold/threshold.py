@@ -190,9 +190,28 @@ class LocalThresholdMap:
 # -------- main entry points --------
 
 
+def query_threshold_neighbors(db, cfg, *, exact_neighbors=False):
+    """Preserve buffered retrieval unless exact eligible-k is requested.
+
+    Unique (demo, timestep) rows bound temporal exclusions. Excluding whole
+    demos needs a full candidate search to avoid returning too few neighbors.
+    """
+    if db.records is None or db.embeddings is None:
+        raise RuntimeError("DB not built")
+    if cfg.k_neighbors < 1 or cfg.temporal_exclusion_radius < 0:
+        raise ValueError("k must be positive and temporal radius nonnegative")
+    k = cfg.k_neighbors + max(2 * cfg.temporal_exclusion_radius + 2, 1)
+    if exact_neighbors and not cfg.same_demo_allowed:
+        k = db.n_states
+    _, indices = db.query(db.embeddings, k=k)
+    filtered = db.filter_neighbors(indices, db.records.demo_id_int, db.records.t, cfg=cfg)
+    return [row[:cfg.k_neighbors] for row in filtered] if exact_neighbors else filtered
+
+
 def compute_global_thresholds_from_db(
     db: StateDatabase,
     cfg: LocalThresholdConfig,
+    *, exact_neighbors: bool = False,
 ) -> np.ndarray:
     """Pool ALL filtered neighbor pairs across the DB into a single per-block
     distribution, then take each quantile.
@@ -209,17 +228,7 @@ def compute_global_thresholds_from_db(
     block_names = list(cfg.block_names)
     quantiles = np.asarray(cfg.quantiles, dtype=np.float64)
 
-    buffer = max(2 * cfg.temporal_exclusion_radius + 2, 1)
-    k = cfg.k_neighbors + buffer
-
-    # Single FAISS query for all states.
-    _, indices = db.query(db.embeddings, k=k)
-    filtered = db.filter_neighbors(
-        indices,
-        db.records.demo_id_int,
-        db.records.t,
-        cfg=cfg,
-    )
+    filtered = query_threshold_neighbors(db, cfg, exact_neighbors=exact_neighbors)
 
     actions = db.records.actions
     pools: dict[str, list[np.ndarray]] = {b: [] for b in block_names}
@@ -253,6 +262,7 @@ def compute_local_thresholds(
     db: StateDatabase,
     cfg: LocalThresholdConfig,
     global_thresholds: np.ndarray,  # (n_blocks, n_quantiles)
+    *, exact_neighbors: bool = False,
 ) -> LocalThresholdMap:
     """For each state in db, compute per-block per-quantile thresholds.
 
@@ -273,16 +283,7 @@ def compute_local_thresholds(
     if global_thresholds.shape != (n_blocks, n_q):
         raise ValueError(f"global_thresholds shape {global_thresholds.shape} != ({n_blocks}, {n_q})")
 
-    buffer = max(2 * cfg.temporal_exclusion_radius + 2, 1)
-    k = cfg.k_neighbors + buffer
-
-    _, indices = db.query(db.embeddings, k=k)
-    filtered = db.filter_neighbors(
-        indices,
-        db.records.demo_id_int,
-        db.records.t,
-        cfg=cfg,
-    )
+    filtered = query_threshold_neighbors(db, cfg, exact_neighbors=exact_neighbors)
 
     actions = db.records.actions
     thresholds = np.zeros((n, n_blocks, n_q), dtype=np.float32)

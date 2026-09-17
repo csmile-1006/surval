@@ -123,14 +123,17 @@ class StateDatabase:
         """Cosine-similarity k-NN.
 
         Returns:
-            distances: (Q, k) float32 — *cosine distance* (= 1 - inner product).
-            indices: (Q, k) int64.
+            distances: (Q, min(k, N)) float32 — cosine distance (= 1 - inner product).
+            indices: (Q, min(k, N)) int64, without FAISS -1 padding.
         """
         if self._index is None:
             raise RuntimeError("Index not built")
+        if k < 1 or self.n_states < 1:
+            raise ValueError("A non-empty database and positive k are required")
         if query_embeddings.dtype != np.float32:
             query_embeddings = query_embeddings.astype(np.float32)
-        sims, indices = self._index.search(query_embeddings, k)  # IP == cosine for unit vectors
+        # FAISS otherwise pads small databases with -1 (a valid numpy index).
+        sims, indices = self._index.search(query_embeddings, min(k, self.n_states))
         distances = (1.0 - sims).astype(np.float32)
         return distances, indices.astype(np.int64)
 

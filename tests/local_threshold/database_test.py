@@ -42,6 +42,14 @@ def test_self_query_distance_zero():
     assert np.allclose(distances[:, 0], 0.0, atol=1e-5)
 
 
+def test_query_larger_than_database_has_no_padding_indices():
+    db, emb, _ = _make_synth_db(n=8, n_demos=2)
+    _, indices = db.query(emb, k=50)
+    assert indices.shape == (8, 8)
+    assert np.all(indices >= 0)
+    assert np.all(indices < 8)
+
+
 def test_filter_excludes_self_and_temporal_window():
     db, emb, rec = _make_synth_db()
     cfg = LocalThresholdConfig(temporal_exclusion_radius=2, same_demo_allowed=True)
