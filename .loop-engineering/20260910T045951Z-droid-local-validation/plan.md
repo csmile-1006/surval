@@ -1,0 +1,19 @@
+# DROID local sequential validation
+
+Run phases directly in this turn. Up to three evidence-driven repair iterations.
+
+1. Patch `octo/octo/data/dataset.py` to carry stable source episode IDs (prefer RLDS file_path, fallback to source trajectory index) and frame indices through existing transformations. Preserve all existing observation/action values and training window behavior.
+2. Patch `droid_policy_learning/robomimic/algo/diffusion_policy.py` to expose inference-encoder features and share that encoding with action inference. Make language initialization lazy and inference deterministic; retain checkpoint network serialization. Patch `sequential_cache_checkpoints.py` to import helpers by package name, accept argv, use dataset language, explicitly set eval mode, align GT at To-1, use saved action offset/scale, require features, support bounded demo/row smoke runs, and write atomically with provenance through `surval.cache_io`. Preserve the existing RLDS action[1:] training convention and record a one-step future action offset.
+3. Extend `surval/cache_io.py` minimally for epoch-indexed writing (existing step callers unchanged). New caches remain normalized for existing MSE extraction and carry offset/scale for physical-unit scoring. Existing missing-validation values remain NaN. Validate cache reuse by checkpoint/file stat, dataset identity and cache settings, not filename alone.
+4. Add `surval/src/surval/droid.py` for checkpoint-local state DB/threshold construction and score/result orchestration. Reuse `StateDatabase`, `LocalThresholdConfig.for_droid_action_space`, `compute_global_thresholds_from_db`, `compute_local_thresholds`, `_compute_from_cache`, and `extract_seqcache_metrics_for_group`. Normalize cached encoder vectors for cosine retrieval. Build action records from the denormalized first action of each aligned chunk. Store DB and threshold artifacts under per-epoch/config directories with source signatures. Reject missing metadata/row mappings. Clamp FAISS query count to actual DB size for small validation datasets.
+5. Add `surval/scripts/cache_droid_checkpoints.py` and `score_droid_cache.py` as thin command entry points. Cache command delegates to corrected DROID producer; score command depends only on cached arrays and surval CPU dependencies. Expose threshold/reduction parameters that are meaningful, but no hard/soft flag. Use the library continuous formula, logsumexp block aggregation and cumulative-product time reduction.
+6. Add one focused runnable contract test under `surval/tests/` and extend relevant existing cache/database tests. Document commands, action/time semantics, normalized baseline units, EMA encoder provenance and outputs in a DROID guide linked from README. Do not implement outcome aggregation yet.
+
+Validation commands (exact smoke checkpoint/data paths recorded in test results):
+
+- `python -m compileall -q <changed Python files>` with bytecode directed under /tmp.
+- Existing interpreter `python -m unittest discover -s tests -p droid_pipeline_test.py` (stdlib contract suite).
+- When approved dependencies are available: `python -m pytest tests/cache_io_test.py tests/local_threshold/database_test.py tests/local_threshold/threshold_test.py tests/ablation_test.py`.
+- Actual cache command with one local epoch, two demos, small batches, bounded rows and one validation batch; then score that cache and inspect CSV/JSON, finite scores, feature provenance and zero missing threshold rows. Run CPU contracts first, then check GPU capacity; never stop unrelated work.
+
+Risks resolved in implementation: checkpoint scale/offset versus validation-fitted statistics; source observation t versus action target t+1; EMA mode and language batch size 1; optional validation off; stale checkpoint/threshold reuse; small k-NN databases returning negative indices; normalized rot6d versus physical rotation geometry. Any environment-only failure stays distinct from product failures.

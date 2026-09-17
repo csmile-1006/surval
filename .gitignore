@@ -13,3 +13,15 @@ venv/
 .coverage
 htmlcov/
 .DS_Store
+
+# Local environments and generated artifacts; keep analysis code and run notes.
+/.venv*/
+/outputs/**/*
+!/outputs/**/
+!/outputs/**/*.py
+!/outputs/**/*.sh
+/.loop-engineering/**/*
+!/.loop-engineering/**/
+!/.loop-engineering/**/*.md
+!/.loop-engineering/**/*.py
+!/.loop-engineering/**/*.sh
